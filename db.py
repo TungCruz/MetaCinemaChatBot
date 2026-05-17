@@ -1,8 +1,10 @@
 """
 Database queries — port of ChatController.cs BuildMovieContext / BuildFoodContext / BuildKnowledgeContext
+Uses pymssql (no system ODBC driver required, works on Render Linux).
 """
 import os
-import pyodbc
+import re
+import pymssql
 from datetime import datetime, timedelta
 from contextlib import contextmanager
 
@@ -21,14 +23,106 @@ def day_vn(weekday: int) -> str:
     return _DAY_NAMES.get(weekday, "")
 
 
-@contextmanager
-def get_conn():
+# ─────────────────────────────────────────────────────────────────────────────
+#  Connection helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _parse_conn() -> dict:
+    """Parse pyodbc-style connection string into pymssql keyword args."""
     conn_str = os.getenv("DB_CONNECTION_STRING", "")
     if not conn_str:
         raise RuntimeError("DB_CONNECTION_STRING not set")
-    conn = pyodbc.connect(conn_str, timeout=10)
+    params = dict(re.findall(r'(\w+)\s*=\s*([^;]+)', conn_str, re.IGNORECASE))
+    return {
+        "server":   params.get("SERVER",   params.get("server",   "")),
+        "database": params.get("DATABASE", params.get("database", "")),
+        "user":     params.get("UID",      params.get("uid",      "")),
+        "password": params.get("PWD",      params.get("pwd",      "")),
+    }
+
+
+class _Row:
+    """Wraps a tuple row to allow attribute (dot) access by column name."""
+    __slots__ = ("_d",)
+
+    def __init__(self, cols, values):
+        object.__setattr__(self, "_d", dict(zip(cols, values)))
+
+    def __getattr__(self, name):
+        try:
+            return object.__getattribute__(self, "_d")[name]
+        except KeyError:
+            raise AttributeError(name)
+
+    def __getitem__(self, key):
+        return object.__getattribute__(self, "_d")[key]
+
+
+class _Cursor:
+    """
+    Wraps a pymssql cursor to be API-compatible with pyodbc:
+    - Converts ? placeholders → %s (pymssql style)
+    - execute() accepts positional args: c.execute(sql, p1, p2, ...)
+    - fetchone() / fetchall() return objects with dot-notation column access
+    """
+
+    def __init__(self, cursor):
+        self._c = cursor
+
+    def execute(self, sql, *args):
+        sql = sql.replace("?", "%s")
+        if not args:
+            self._c.execute(sql)
+        elif len(args) == 1 and isinstance(args[0], (tuple, list)):
+            self._c.execute(sql, tuple(args[0]))
+        else:
+            self._c.execute(sql, args)
+        return self
+
+    def _cols(self):
+        return [d[0] for d in (self._c.description or [])]
+
+    def fetchone(self):
+        row = self._c.fetchone()
+        if row is None:
+            return None
+        cols = self._cols()
+        return _Row(cols, row)
+
+    def fetchall(self):
+        cols = self._cols()
+        return [_Row(cols, row) for row in self._c.fetchall()]
+
+    def __getattr__(self, name):
+        return getattr(self._c, name)
+
+
+class _Conn:
+    """Thin wrapper so get_conn() yields an object with .cursor() and .commit()."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def cursor(self):
+        return _Cursor(self._conn.cursor())
+
+    def commit(self):
+        self._conn.commit()
+
+
+@contextmanager
+def get_conn():
+    p = _parse_conn()
+    conn = pymssql.connect(
+        server=p["server"],
+        database=p["database"],
+        user=p["user"],
+        password=p["password"],
+        login_timeout=10,
+        timeout=30,
+    )
     try:
-        yield conn
+        yield _Conn(conn)
     finally:
         conn.close()
 
