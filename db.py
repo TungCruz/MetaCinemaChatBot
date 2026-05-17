@@ -42,11 +42,12 @@ def _parse_conn() -> dict:
 
 
 class _Row:
-    """Wraps a tuple row to allow attribute (dot) access by column name."""
-    __slots__ = ("_d",)
+    """Wraps a tuple row to allow both attribute (dot) and integer index access."""
+    __slots__ = ("_d", "_v")
 
     def __init__(self, cols, values):
         object.__setattr__(self, "_d", dict(zip(cols, values)))
+        object.__setattr__(self, "_v", tuple(values))
 
     def __getattr__(self, name):
         try:
@@ -55,6 +56,8 @@ class _Row:
             raise AttributeError(name)
 
     def __getitem__(self, key):
+        if isinstance(key, int):
+            return object.__getattribute__(self, "_v")[key]
         return object.__getattribute__(self, "_d")[key]
 
 
