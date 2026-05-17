@@ -159,6 +159,7 @@ def _is_admin_staff_q(nm: str) -> bool:
     return any(kw in nm for kw in [
         "nhan vien", "staff", "nhan su",
         "quan ly ca", "vai tro", "len lam", "nang cap chuc", "thang chuc",
+        "xuong lam", "ha chuc", "giang chuc", "sua vai tro", "cap nhat vai tro",
     ])
 
 def _is_admin_customer_q(nm: str) -> bool:
@@ -482,7 +483,12 @@ def _food(message: str, nm: str, now: datetime) -> dict:
         return {"reply": f"Lỗi tải đồ ăn: {e}", "actions": []}
 
 
-_ROLE_CHANGE_KW = ["len lam", "nang cap", "thang chuc", "doi vai tro", "giao chuc vu", "chuyen sang vai tro"]
+_ROLE_CHANGE_KW = [
+    "len lam", "xuong lam", "ha chuc", "giang chuc", "nang cap", "thang chuc",
+    "doi vai tro", "giao chuc vu", "chuyen sang vai tro", "chuyen sang",
+    "cap nhat vai tro", "sua vai tro", "sua nhan vien", "thanh nhan vien",
+    "thanh quan ly",
+]
 
 # Map từ keyword (dạng đã normalize) → tên vai trò lưu trong DB
 _ROLE_MAP = {
@@ -491,6 +497,34 @@ _ROLE_MAP = {
     "nhan vien ban ve": "Nhân viên bán vé",
     "nhan vien":        "Nhân viên bán vé",
 }
+
+
+def _detect_target_staff_role(nm: str) -> Optional[str]:
+    # Ưu tiên vai trò nằm sau từ khóa chuyển đổi để tránh nhầm vai trò hiện tại.
+    transition_patterns = [
+        r"(?:len\s+lam|xuong\s+lam|ha\s+chuc\s+(?:xuong\s+)?|giang\s+chuc\s+(?:xuong\s+)?|"
+        r"doi\s+vai\s+tro\s+(?:thanh\s+|sang\s+)?|chuyen\s+sang(?:\s+vai\s+tro)?|"
+        r"giao\s+chuc\s+vu|cap\s+nhat\s+vai\s+tro\s+(?:thanh\s+|sang\s+)?|"
+        r"sua\s+vai\s+tro\s+(?:thanh\s+|sang\s+)?|thanh)\s+(.+)$",
+    ]
+    for pattern in transition_patterns:
+        match = re.search(pattern, nm)
+        if not match:
+            continue
+        target_text = match.group(1)
+        for kw, role in _ROLE_MAP.items():
+            if kw in target_text:
+                return role
+
+    if any(kw in nm for kw in ["xuong lam", "ha chuc", "giang chuc"]):
+        return "Nhân viên bán vé"
+    if any(kw in nm for kw in ["len lam", "nang cap", "thang chuc"]):
+        return "Quản lý ca"
+
+    for kw, role in _ROLE_MAP.items():
+        if kw in nm:
+            return role
+    return None
 
 
 def _staff(message: str, nm: str) -> dict:
@@ -525,15 +559,8 @@ def _staff(message: str, nm: str) -> dict:
 
 
 def _staff_set_role(message: str, nm: str) -> dict:
-    import re
-
     # 1. Xác định vai trò mới
-    new_role = None
-    for kw, role in _ROLE_MAP.items():
-        if kw in nm:
-            new_role = role
-            break
-
+    new_role = _detect_target_staff_role(nm)
     if new_role is None:
         return {
             "reply": "Vui lòng cho biết vai trò muốn gán.\nVí dụ: 'Quản lý ca' hoặc 'Nhân viên bán vé'.",
