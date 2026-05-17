@@ -94,16 +94,24 @@ def extract_requested_date(message: str, now: datetime) -> Optional[datetime]:
     if "ngay mai" in nm or "mai" in nm:
         return datetime.combine(today + timedelta(days=1), datetime.min.time())
 
-    match = re.search(r"(\d{1,2})[/\-](\d{1,2})(?:[/\-](\d{2,4}))?", message)
-    if match:
-        day, month = int(match.group(1)), int(match.group(2))
-        year = int(match.group(3)) if match.group(3) else today.year
-        if year < 100:
-            year += 2000
+    # Match date patterns — skip time-like tokens (hh:mm already separated by ':')
+    # Only accept day/month[/year] separated by / or -
+    # Use finditer to avoid matching the first occurrence blindly
+    current_year = today.year
+    for match in re.finditer(r"(?<!\d)(\d{1,2})[/\-](\d{1,2})(?:[/\-](\d{2,4}))?(?!\d)", message):
         try:
-            return datetime(year, month, day)
+            day, month = int(match.group(1)), int(match.group(2))
+            year = int(match.group(3)) if match.group(3) else current_year
+            if year < 100:
+                year += 2000
+            # Sanity check: year must be within ±2 years of current year
+            if not (current_year - 1 <= year <= current_year + 2):
+                continue
+            # Sanity check: valid calendar date
+            d = datetime(year, month, day)
+            return d
         except ValueError:
-            pass
+            continue
 
     day_map = {
         "thu hai": 0, "thu 2": 0,

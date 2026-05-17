@@ -262,8 +262,8 @@ def _staff_showtime(message: str, now: datetime) -> dict:
     day_end   = day_start + timedelta(days=1)
 
     sql = """
-        SELECT s.StartTime, ISNULL(m.Title,'Phim chưa rõ') AS title,
-               ISNULL(r.Name,'?') AS room_name,
+        SELECT s.StartTime, ISNULL(m.Title,'Phim chua ro') AS title,
+               ISNULL(r.Name,'N/A') AS room_name,
                (r.SeatRows * r.SeatCols) AS total_seats,
                (SELECT COUNT(*) FROM BookingSeats bs
                 INNER JOIN Bookings b ON b.Id = bs.BookingId

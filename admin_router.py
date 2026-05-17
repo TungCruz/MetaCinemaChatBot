@@ -146,6 +146,11 @@ def _is_admin_payment_q(nm: str) -> bool:
 def _is_admin_showtime_q(nm: str) -> bool:
     return any(kw in nm for kw in ["suat chieu", "lich chieu", "gio chieu", "lich hom nay", "lich ngay"])
 
+def _is_delete_showtime_q(nm: str) -> bool:
+    delete_verb = any(kw in nm for kw in ["xoa", "xóa", "delete", "huy het", "xoa het", "xoa tat ca"])
+    showtime_kw = any(kw in nm for kw in ["suat chieu", "suat", "lich chieu"])
+    return delete_verb and showtime_kw
+
 def _is_admin_movie_q(nm: str) -> bool:
     return any(kw in nm for kw in ["phim", "top phim", "dang chieu", "sap chieu"])
 
@@ -321,8 +326,8 @@ def _showtime(message: str, now: datetime) -> dict:
     day_end   = day_start + timedelta(days=1)
 
     sql = """
-        SELECT s.Id, s.StartTime, s.BasePrice, ISNULL(m.Title,'Phim chưa rõ') AS title,
-               ISNULL(r.Name,'?') AS room_name,
+        SELECT s.Id, s.StartTime, s.BasePrice, ISNULL(m.Title,'Phim chua ro') AS title,
+               ISNULL(r.Name,'N/A') AS room_name,
                (r.SeatRows * r.SeatCols) AS total_seats,
                (SELECT COUNT(*) FROM BookingSeats bs
                 INNER JOIN Bookings b ON b.Id=bs.BookingId
@@ -413,8 +418,8 @@ def _rooms(now: datetime) -> dict:
         FROM Rooms r ORDER BY r.Name
     """
     sql_busy = """
-        SELECT TOP 3 s.Id, s.StartTime, ISNULL(m.Title,'Phim chưa rõ') AS title,
-               ISNULL(r.Name,'?') AS room_name,
+        SELECT TOP 3 s.Id, s.StartTime, ISNULL(m.Title,'Phim chua ro') AS title,
+               ISNULL(r.Name,'N/A') AS room_name,
                (r.SeatRows * r.SeatCols) AS total,
                (SELECT COUNT(*) FROM BookingSeats bs
                 INNER JOIN Bookings b ON b.Id=bs.BookingId
@@ -874,9 +879,14 @@ def _is_create_showtime_q(nm: str) -> bool:
 def _is_bulk_create_q(nm: str) -> bool:
     if not _is_create_showtime_q(nm):
         return False
+    # Nếu user đã ghi giờ cụ thể (HH:mm / HHh / HH gio) → đây là single showtime, không phải bulk
+    has_specific_time = bool(re.search(
+        r"(?<!\d)(?:[01]?\d|2[0-3])\s*(?::|h|gio)\s*(?:[0-5]\d)?(?!\d)", nm))
+    if has_specific_time:
+        return False
     return (any(kw in nm for kw in ["tat ca phim", "cac phim", "hang loat", "bulk", "moi ngay"])
             or bool(re.search(r"\b\d{1,2}\s*ngay\s*(?:toi|tiep theo|sap toi|ke tiep)\b", nm))
-            or bool(re.search(r"\b\d{1,2}\s*suat(?:\s*chieu)?\b", nm)))
+            or bool(re.search(r"\b[2-9]\d*\s*suat(?:\s*chieu)?\b", nm)))
 
 
 def _is_all_now_showing_q(nm: str) -> bool:
@@ -1205,8 +1215,73 @@ def _save_bulk_plan(plan_items: list, now: datetime) -> tuple:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Showtime creation reply builders
+#  Showtime creation / deletion reply builders
 # ─────────────────────────────────────────────────────────────────────────────
+def _delete_showtimes(message: str, nm: str, now: datetime) -> dict:
+    """Xóa suất chiếu theo ngày — chỉ xóa suất chưa bán vé."""
+    requested = extract_requested_date(message, now) or datetime.combine(now.date(), datetime.min.time())
+    day_start = requested.replace(hour=0, minute=0, second=0)
+    day_end   = day_start + timedelta(days=1)
+
+    # Tìm suất trong ngày
+    sql_find = """
+        SELECT s.Id, s.StartTime, ISNULL(m.Title,'Phim chua ro') AS title,
+               ISNULL(r.Name,'N/A') AS room_name,
+               (SELECT COUNT(*) FROM BookingSeats bs
+                INNER JOIN Bookings b ON b.Id = bs.BookingId
+                WHERE b.ShowtimeId = s.Id
+                  AND b.PaymentStatus IN ('Paid','PendingPayment','CheckedIn')
+               ) AS sold_seats
+        FROM Showtimes s
+        LEFT JOIN Movies m ON m.Id = s.MovieId
+        LEFT JOIN Rooms  r ON r.Id = s.RoomId
+        WHERE s.StartTime >= ? AND s.StartTime < ?
+        ORDER BY s.StartTime
+    """
+    try:
+        with get_conn() as conn:
+            c = conn.cursor()
+            c.execute(sql_find, day_start, day_end)
+            rows = c.fetchall()
+    except Exception as e:
+        return {"reply": f"Lỗi tải suất chiếu: {e}", "actions": []}
+
+    if not rows:
+        return {
+            "reply": f"Không có suất chiếu nào trong ngày {day_start.strftime('%d/%m/%Y')} để xóa.",
+            "actions": [_admin_action("Quản lý suất chiếu", "Showtimes")],
+        }
+
+    can_delete  = [r for r in rows if int(r.sold_seats or 0) == 0]
+    has_tickets = [r for r in rows if int(r.sold_seats or 0) > 0]
+
+    if not can_delete:
+        lines = [f"Không thể xóa: tất cả {len(rows)} suất ngày {day_start.strftime('%d/%m/%Y')} đều đã có vé đặt."]
+        for r in has_tickets[:5]:
+            room = r.room_name if normalize(r.room_name).startswith("phong") else f"Phòng {r.room_name}"
+            lines.append(f"- {r.StartTime.strftime('%H:%M')} | {r.title} | {room} | {r.sold_seats} vé")
+        return {"reply": "\n".join(lines), "actions": [_admin_action("Quản lý suất chiếu", "Showtimes")]}
+
+    ids_to_delete = [r.Id for r in can_delete]
+    try:
+        with get_conn() as conn:
+            c = conn.cursor()
+            placeholders = ",".join(["?"] * len(ids_to_delete))
+            c.execute(f"DELETE FROM Showtimes WHERE Id IN ({placeholders})", *ids_to_delete)
+            conn.commit()
+    except Exception as e:
+        return {"reply": f"Lỗi xóa suất chiếu: {e}", "actions": []}
+
+    lines = [f"Đã xóa {len(can_delete)} suất chiếu ngày {day_start.strftime('%d/%m/%Y')}."]
+    for r in can_delete[:8]:
+        room = r.room_name if normalize(r.room_name).startswith("phong") else f"Phòng {r.room_name}"
+        lines.append(f"- {r.StartTime.strftime('%H:%M')} | {r.title} | {room}")
+    if has_tickets:
+        lines.append(f"Giữ lại {len(has_tickets)} suất đã có vé đặt (không thể xóa).")
+
+    return {"reply": "\n".join(lines), "actions": [_admin_action("Quản lý suất chiếu", "Showtimes")]}
+
+
 def _create_showtime(message: str, nm: str, now: datetime) -> dict:
     """Port of BuildAdminCreateShowtimeReply — single showtime creation."""
     movie_id = _resolve_movie_id(nm)
@@ -1268,7 +1343,7 @@ def _create_showtime(message: str, nm: str, now: datetime) -> dict:
         with get_conn() as conn:
             c = conn.cursor()
             c.execute(
-                "SELECT s.StartTime, ISNULL(m.DurationMinutes,0) AS dur, ISNULL(m.Title,'?') AS title"
+                "SELECT s.StartTime, ISNULL(m.DurationMinutes,0) AS dur, ISNULL(m.Title,'Phim chua ro') AS title"
                 " FROM Showtimes s LEFT JOIN Movies m ON m.Id=s.MovieId WHERE s.RoomId=?",
                 room_dict["id"])
             existing = c.fetchall()
@@ -1500,6 +1575,8 @@ def try_build_admin_reply(message: str, role: Optional[str], now: datetime, user
         return _bulk_cancel(user_id)
     if _is_bulk_confirm_q(nm, has_plan):
         return _bulk_confirm(user_id, now)
+    if _is_delete_showtime_q(nm):
+        return _delete_showtimes(message, nm, now)
     if _is_bulk_create_q(nm):
         return _bulk_create_showtime(message, nm, now, user_id)
     if _is_create_showtime_q(nm):
