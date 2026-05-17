@@ -159,6 +159,10 @@ def _build_showtime_actions(rows: list) -> list:
             "url": f"/Booking/SelectSeat?showtimeId={sid}",
             "movieId": row.MovieId,
             "showtimeId": sid,
+            "movieTitle": row.MovieTitle,
+            "showtimeLabel": f"{row.StartTime.strftime('%d/%m/%Y %H:%M')} - {_format_room(row.RoomName)}",
+            "roomName": row.RoomName or "",
+            "price": float(row.BasePrice or 0),
         })
     return actions[:6]
 
