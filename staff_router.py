@@ -1,6 +1,10 @@
 """
 Port of ChatController.cs BuildStaffReply and sub-methods.
 Auth: C# passes role from Session["StaffRole"] → Python trusts it.
+
+Role-based access:
+  Nhân viên bán vé  → showtime, room, food, payment info, counter guide (NO revenue)
+  Quản lý ca / Admin → all above + revenue report, staff stats, attendance
 """
 import re
 from datetime import datetime, timedelta
@@ -17,9 +21,9 @@ def _staff_action(label: str, action: str) -> dict:
     return {"type": "open_url", "label": label, "url": f"/Staff/Staff/{action}"}
 
 
-# Normalized role names (after calling normalize()) that count as staff/shiftmanager.
-# C# stores Vietnamese role strings like "Quản lý ca", "Nhân viên bán vé" in the DB.
-# normalize() strips diacritics → "quan ly ca", "nhan vien ban ve", "admin".
+# ─────────────────────────────────────────────────────────────────────────────
+#  Role sets  (normalized via normalize() — removes diacritics, lowercase)
+# ─────────────────────────────────────────────────────────────────────────────
 _STAFF_ROLES = {
     "admin",
     "staff",
@@ -57,7 +61,7 @@ def _is_showtime_q(nm: str) -> bool:
 
 
 def _is_attendance_q(nm: str) -> bool:
-    return any(kw in nm for kw in ["cham cong", "check in", "check out", "ca lam", "gio lam"])
+    return any(kw in nm for kw in ["cham cong", "check in", "check out", "ca lam", "gio lam", "diem danh"])
 
 
 def _is_counter_sale_q(nm: str) -> bool:
@@ -76,15 +80,74 @@ def _is_payment_q(nm: str) -> bool:
     return any(kw in nm for kw in ["thanh toan", "payos", "giao dich", "cho thanh toan", "that bai", "pending", "failed"])
 
 
+def _is_revenue_q(nm: str) -> bool:
+    """Báo cáo doanh thu — chỉ quản lý ca."""
+    return any(kw in nm for kw in [
+        "doanh thu", "bao cao", "thong ke doanh", "doanh so",
+        "tong thu", "ban duoc bao nhieu", "thu duoc bao nhieu",
+        "oanh so", "thu nhap hom nay",
+    ])
+
+
+def _is_staff_stats_q(nm: str) -> bool:
+    """Thống kê nhân viên — chỉ quản lý ca."""
+    return any(kw in nm for kw in [
+        "thong ke nhan vien", "nhan su", "danh sach nhan vien",
+        "so luong nhan vien", "nhan vien hom nay", "bao nhieu nhan vien",
+        "co bao nhieu nguoi", "nhan vien nao",
+    ])
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-#  Staff dashboard
+#  Dashboard — cơ bản (nhân viên bán vé): không có doanh thu
 # ─────────────────────────────────────────────────────────────────────────────
-def _staff_dashboard(role: Optional[str], now: datetime) -> dict:
+def _staff_dashboard_basic(now: datetime) -> dict:
     today_start = now.date()
-    today_end = today_start + timedelta(days=1)
-    today_utc_s = _vn_to_utc(datetime.combine(today_start, datetime.min.time()))
-    today_utc_e = today_utc_s + timedelta(days=1)
-    next_week = datetime.combine(today_start + timedelta(days=8), datetime.min.time())
+    today_end   = today_start + timedelta(days=1)
+    next_week   = datetime.combine(today_start + timedelta(days=8), datetime.min.time())
+
+    sql_shows_today = "SELECT COUNT(*) FROM Showtimes WHERE StartTime >= ? AND StartTime < ?"
+    sql_upcoming    = "SELECT COUNT(*) FROM Showtimes WHERE StartTime >= ? AND StartTime < ?"
+    sql_pending     = "SELECT COUNT(*) FROM Bookings WHERE PaymentStatus IN ('PendingPayment','PendingSelect')"
+    sql_rooms       = "SELECT COUNT(*) FROM Rooms"
+
+    try:
+        with get_conn() as conn:
+            c = conn.cursor()
+            c.execute(sql_shows_today, today_start, today_end)
+            shows_today = c.fetchone()[0]
+            c.execute(sql_upcoming, now, next_week)
+            upcoming = c.fetchone()[0]
+            c.execute(sql_pending)
+            pending = c.fetchone()[0]
+            c.execute(sql_rooms)
+            total_rooms = c.fetchone()[0]
+
+        lines = [
+            "Tổng quan vận hành hôm nay:",
+            f"- Suất chiếu hôm nay: {shows_today} suất; 7 ngày tới: {upcoming} suất.",
+            f"- Giao dịch khách đang chờ thanh toán: {pending}.",
+            f"- Phòng chiếu: {total_rooms} phòng.",
+        ]
+        actions = [
+            _staff_action("Xác thực vé", "Index"),
+            _staff_action("Phòng chiếu", "RoomStatus"),
+            _staff_action("Bán vé tại quầy", "Sales"),
+        ]
+        return {"reply": "\n".join(lines), "actions": actions}
+    except Exception as e:
+        return {"reply": f"Lỗi tải dashboard: {e}", "actions": [_staff_action("Trang nhân viên", "Index")]}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Dashboard — đầy đủ (quản lý ca): có doanh thu
+# ─────────────────────────────────────────────────────────────────────────────
+def _staff_dashboard_full(now: datetime) -> dict:
+    today_start  = now.date()
+    today_end    = today_start + timedelta(days=1)
+    today_utc_s  = _vn_to_utc(datetime.combine(today_start, datetime.min.time()))
+    today_utc_e  = today_utc_s + timedelta(days=1)
+    next_week    = datetime.combine(today_start + timedelta(days=8), datetime.min.time())
 
     sql_counter = """
         SELECT COUNT(b.Id) AS cnt,
@@ -97,10 +160,17 @@ def _staff_dashboard(role: Optional[str], now: datetime) -> dict:
           AND b.PaymentStatus IN ('Paid','CheckedIn')
           AND b.CreatedAt >= ? AND b.CreatedAt < ?
     """
+    sql_online = """
+        SELECT ISNULL(SUM(b.GrandTotal), 0) AS revenue
+        FROM Bookings b
+        WHERE b.UserId IS NOT NULL AND b.UserId > 0
+          AND b.PaymentStatus IN ('Paid','CheckedIn')
+          AND b.CreatedAt >= ? AND b.CreatedAt < ?
+    """
     sql_shows_today = "SELECT COUNT(*) FROM Showtimes WHERE StartTime >= ? AND StartTime < ?"
-    sql_upcoming = "SELECT COUNT(*) FROM Showtimes WHERE StartTime >= ? AND StartTime < ?"
-    sql_pending = "SELECT COUNT(*) FROM Bookings WHERE PaymentStatus IN ('PendingPayment','PendingSelect')"
-    sql_rooms = "SELECT COUNT(*) FROM Rooms"
+    sql_upcoming    = "SELECT COUNT(*) FROM Showtimes WHERE StartTime >= ? AND StartTime < ?"
+    sql_pending     = "SELECT COUNT(*) FROM Bookings WHERE PaymentStatus IN ('PendingPayment','PendingSelect')"
+    sql_rooms       = "SELECT COUNT(*) FROM Rooms"
 
     try:
         with get_conn() as conn:
@@ -108,9 +178,12 @@ def _staff_dashboard(role: Optional[str], now: datetime) -> dict:
 
             c.execute(sql_counter, today_utc_s, today_utc_e)
             row = c.fetchone()
-            cnt_invoices = int(row.cnt or 0)
-            cnt_tickets = int(row.tickets or 0)
-            cnt_revenue = float(row.revenue or 0)
+            cnt_invoices  = int(row.cnt or 0)
+            cnt_tickets   = int(row.tickets or 0)
+            cnt_revenue   = float(row.revenue or 0)
+
+            c.execute(sql_online, today_utc_s, today_utc_e)
+            online_revenue = float(c.fetchone()[0] or 0)
 
             c.execute(sql_shows_today, today_start, today_end)
             shows_today = c.fetchone()[0]
@@ -124,24 +197,25 @@ def _staff_dashboard(role: Optional[str], now: datetime) -> dict:
             c.execute(sql_rooms)
             total_rooms = c.fetchone()[0]
 
+        total_revenue = cnt_revenue + online_revenue
         lines = [
-            "Tổng quan vận hành nhân viên:",
-            f"- Hôm nay có {shows_today} suất chiếu; 7 ngày tới còn {upcoming} suất.",
-            f"- Bán tại quầy hôm nay: {cnt_invoices} hóa đơn, {cnt_tickets} vé, {_fmt_money(cnt_revenue)}.",
-            f"- Giao dịch khách đang chờ: {pending}.",
+            "Tổng quan vận hành hôm nay (Quản lý ca):",
+            f"- Suất chiếu hôm nay: {shows_today} suất; 7 ngày tới: {upcoming} suất.",
+            f"- Bán tại quầy: {cnt_invoices} hóa đơn, {cnt_tickets} vé — {_fmt_money(cnt_revenue)}.",
+            f"- Đặt vé online: {_fmt_money(online_revenue)}.",
+            f"- Tổng doanh thu hôm nay: {_fmt_money(total_revenue)}.",
+            f"- Giao dịch đang chờ: {pending}.",
             f"- Phòng chiếu: {total_rooms} phòng.",
         ]
         actions = [
             _staff_action("Xác thực vé", "Index"),
             _staff_action("Phòng chiếu", "RoomStatus"),
             _staff_action("Bán vé tại quầy", "Sales"),
+            _staff_action("Chấm công", "Attendance"),
         ]
-        if _is_shiftmanager(role):
-            actions.append(_staff_action("Chấm công", "Attendance"))
-
         return {"reply": "\n".join(lines), "actions": actions}
     except Exception as e:
-        return {"reply": f"Lỗi tải dashboard nhân viên: {e}", "actions": [_staff_action("Trang nhân viên", "Index")]}
+        return {"reply": f"Lỗi tải dashboard: {e}", "actions": [_staff_action("Trang nhân viên", "Index")]}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -149,7 +223,7 @@ def _staff_dashboard(role: Optional[str], now: datetime) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 def _staff_room(now: datetime) -> dict:
     today_start = now.date()
-    today_end = today_start + timedelta(days=1)
+    today_end   = today_start + timedelta(days=1)
 
     sql = """
         SELECT r.Id, r.Name,
@@ -185,7 +259,7 @@ def _staff_room(now: datetime) -> dict:
 def _staff_showtime(message: str, now: datetime) -> dict:
     requested = extract_requested_date(message, now) or datetime.combine(now.date(), datetime.min.time())
     day_start = requested.replace(hour=0, minute=0, second=0)
-    day_end = day_start + timedelta(days=1)
+    day_end   = day_start + timedelta(days=1)
 
     sql = """
         SELECT s.StartTime, ISNULL(m.Title,'Phim chưa rõ') AS title,
@@ -213,8 +287,8 @@ def _staff_showtime(message: str, now: datetime) -> dict:
         else:
             for s in rows[:8]:
                 total = int(s.total_seats or 0)
-                sold = int(s.sold_seats or 0)
-                room = s.room_name if normalize(s.room_name).startswith("phong") else f"Phòng {s.room_name}"
+                sold  = int(s.sold_seats or 0)
+                room  = s.room_name if normalize(s.room_name).startswith("phong") else f"Phòng {s.room_name}"
                 lines.append(f"- {s.StartTime.strftime('%H:%M')} | {s.title} | {room} | đã bán/giữ {sold}/{total}")
             if len(rows) > 8:
                 lines.append(f"Còn {len(rows) - 8} suất khác trong ngày.")
@@ -225,17 +299,131 @@ def _staff_showtime(message: str, now: datetime) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Staff attendance (ShiftManager only)
+#  Attendance — chỉ quản lý ca, có dữ liệu thực hôm nay
 # ─────────────────────────────────────────────────────────────────────────────
-def _staff_attendance(role: Optional[str]) -> dict:
+def _staff_attendance(role: Optional[str], now: datetime) -> dict:
     if not _is_shiftmanager(role):
         return {
-            "reply": "Chỉ quản lý ca mới xem được dữ liệu chấm công trong khu vực nhân viên.",
+            "reply": "Chức năng chấm công chỉ dành cho Quản lý ca. Bạn không có quyền truy cập.",
             "actions": [_staff_action("Trang nhân viên", "Index")],
         }
+
+    today_start = datetime.combine(now.date(), datetime.min.time())
+    today_end   = today_start + timedelta(days=1)
+    today_utc_s = _vn_to_utc(today_start)
+    today_utc_e = today_utc_s + timedelta(days=1)
+
+    sql = """
+        SELECT a.StaffName, a.Role,
+               a.CheckIn, a.CheckOut,
+               ISNULL(a.Hours, 0) AS hours,
+               ISNULL(a.Amount, 0) AS amount
+        FROM Attendance a
+        WHERE a.CheckIn >= ? AND a.CheckIn < ?
+        ORDER BY a.CheckIn
+    """
+    sql_total = """
+        SELECT COUNT(*) AS cnt,
+               ISNULL(SUM(a.Hours), 0) AS total_hours,
+               ISNULL(SUM(a.Amount), 0) AS total_amount
+        FROM Attendance a
+        WHERE a.CheckIn >= ? AND a.CheckIn < ?
+    """
+    try:
+        with get_conn() as conn:
+            c = conn.cursor()
+            c.execute(sql, today_utc_s, today_utc_e)
+            rows = c.fetchall()
+            c.execute(sql_total, today_utc_s, today_utc_e)
+            tot = c.fetchone()
+
+        cnt_staff    = int(tot.cnt or 0)
+        total_hours  = float(tot.total_hours or 0)
+        total_amount = float(tot.total_amount or 0)
+
+        lines = [f"Chấm công hôm nay ({now.strftime('%d/%m/%Y')}): {cnt_staff} lượt."]
+        if not rows:
+            lines.append("Chưa có nhân viên nào check-in hôm nay.")
+        else:
+            for r in rows[:10]:
+                checkout = r.CheckOut.strftime("%H:%M") if r.CheckOut else "—"
+                hrs = f"{float(r.hours or 0):.1f}h"
+                lines.append(
+                    f"- {r.StaffName} ({r.Role}): vào {r.CheckIn.strftime('%H:%M')} — ra {checkout} | {hrs} | {_fmt_money(float(r.amount or 0))}"
+                )
+            if len(rows) > 10:
+                lines.append(f"Còn {len(rows) - 10} nhân viên khác.")
+            lines.append(f"Tổng: {total_hours:.1f} giờ — {_fmt_money(total_amount)}.")
+
+        return {
+            "reply": "\n".join(lines),
+            "actions": [_staff_action("Trang chấm công", "Attendance")],
+        }
+    except Exception as e:
+        return {
+            "reply": f"Lỗi tải dữ liệu chấm công: {e}",
+            "actions": [_staff_action("Chấm công", "Attendance")],
+        }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Staff statistics — chỉ quản lý ca
+# ─────────────────────────────────────────────────────────────────────────────
+def _staff_stats(now: datetime) -> dict:
+    sql_by_role = "SELECT Role, COUNT(*) AS cnt FROM Staff GROUP BY Role ORDER BY cnt DESC"
+    sql_total   = "SELECT COUNT(*) FROM Staff"
+    sql_checkin_today = """
+        SELECT COUNT(DISTINCT a.StaffId) AS cnt
+        FROM Attendance a
+        WHERE CAST(a.CheckIn AS DATE) = CAST(? AS DATE)
+    """
+
+    try:
+        with get_conn() as conn:
+            c = conn.cursor()
+
+            c.execute(sql_total)
+            total_staff = int(c.fetchone()[0] or 0)
+
+            c.execute(sql_by_role)
+            roles = c.fetchall()
+
+            c.execute(sql_checkin_today, now.date())
+            checkin_today = int(c.fetchone().cnt or 0)
+
+        lines = [f"Thống kê nhân viên ({now.strftime('%d/%m/%Y')}):"]
+        lines.append(f"- Tổng số nhân viên: {total_staff} người.")
+        for r in roles:
+            lines.append(f"  • {r.Role or 'Chưa phân vai'}: {int(r.cnt)} người")
+        lines.append(f"- Đã check-in hôm nay: {checkin_today} người.")
+
+        return {
+            "reply": "\n".join(lines),
+            "actions": [_staff_action("Chấm công", "Attendance")],
+        }
+    except Exception as e:
+        return {
+            "reply": f"Lỗi tải thống kê nhân viên: {e}",
+            "actions": [_staff_action("Trang nhân viên", "Index")],
+        }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Counter sales — nhân viên bán vé chỉ xem hướng dẫn, không thấy doanh thu
+# ─────────────────────────────────────────────────────────────────────────────
+def _counter_sale_info() -> dict:
+    """Hướng dẫn bán vé tại quầy — không hiển thị doanh thu."""
+    lines = [
+        "Bán vé tại quầy — hướng dẫn nhanh:",
+        "1. Vào trang Bán vé tại quầy.",
+        "2. Chọn phim → chọn suất chiếu → chọn ghế trống.",
+        "3. Thêm đồ ăn/uống nếu khách muốn.",
+        "4. Nhấn Hoàn tất — hóa đơn được ghi nhận ngay.",
+        "Báo cáo doanh thu chi tiết chỉ dành cho Quản lý ca.",
+    ]
     return {
-        "reply": "Mình chưa hỗ trợ xem chấm công qua chatbot Python. Bạn vào trang Chấm công để xem chi tiết.",
-        "actions": [_staff_action("Chấm công", "Attendance")],
+        "reply": "\n".join(lines),
+        "actions": [_staff_action("Bán vé tại quầy", "Sales")],
     }
 
 
@@ -244,25 +432,63 @@ def _staff_attendance(role: Optional[str]) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 def try_build_staff_reply(message: str, role: Optional[str], now: datetime) -> Optional[dict]:
     """Called from main.py when pageContext.area/mode == 'staff'. Returns None → fall through to Gemini."""
+
+    # ── Kiểm tra xác thực ────────────────────────────────────────────────────
     if not _is_staff_auth(role):
         return {
             "reply": "Bạn cần đăng nhập tài khoản nhân viên để dùng trợ lý vận hành.",
             "actions": [{"type": "open_url", "label": "Đăng nhập", "url": "/User/Login"}],
         }
 
+    is_manager = _is_shiftmanager(role)
     nm = normalize(message)
 
+    # ── Thống kê nhân viên (chỉ quản lý ca) ─────────────────────────────────
+    if _is_staff_stats_q(nm):
+        if not is_manager:
+            return {
+                "reply": "Thống kê nhân viên chỉ dành cho Quản lý ca.",
+                "actions": [_staff_action("Trang nhân viên", "Index")],
+            }
+        return _staff_stats(now)
+
+    # ── Báo cáo doanh thu (chỉ quản lý ca) ──────────────────────────────────
+    if _is_revenue_q(nm):
+        if not is_manager:
+            return {
+                "reply": "Báo cáo doanh thu chỉ dành cho Quản lý ca. Bạn không có quyền xem mục này.",
+                "actions": [_staff_action("Trang nhân viên", "Index")],
+            }
+        return _counter_sales(message, nm, now)
+
+    # ── Chấm công (chỉ quản lý ca) ───────────────────────────────────────────
+    if _is_attendance_q(nm):
+        return _staff_attendance(role, now)
+
+    # ── Suất chiếu / ghế ─────────────────────────────────────────────────────
     if _is_seat_status_q(nm) or _is_showtime_q(nm):
         return _staff_showtime(message, now)
-    if _is_attendance_q(nm):
-        return _staff_attendance(role)
+
+    # ── Bán vé tại quầy ──────────────────────────────────────────────────────
     if _is_counter_sale_q(nm):
-        return _counter_sales(message, nm, now)
+        # Quản lý ca xem được doanh thu quầy; nhân viên chỉ xem hướng dẫn
+        if is_manager:
+            return _counter_sales(message, nm, now)
+        return _counter_sale_info()
+
+    # ── Phòng chiếu ──────────────────────────────────────────────────────────
     if _is_room_q(nm):
         return _staff_room(now)
+
+    # ── Đồ ăn/uống ───────────────────────────────────────────────────────────
     if _is_food_q(nm):
         return _food(message, nm, now)
+
+    # ── Thanh toán ───────────────────────────────────────────────────────────
     if _is_payment_q(nm):
         return _payment(message, nm, now)
 
-    return _staff_dashboard(role, now)
+    # ── Dashboard mặc định (phân theo role) ─────────────────────────────────
+    if is_manager:
+        return _staff_dashboard_full(now)
+    return _staff_dashboard_basic(now)
