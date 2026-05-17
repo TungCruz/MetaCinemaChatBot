@@ -156,7 +156,10 @@ def _is_admin_food_q(nm: str) -> bool:
     return any(kw in nm for kw in ["do an", "do uong", "combo", "bap", "nuoc", "menu"])
 
 def _is_admin_staff_q(nm: str) -> bool:
-    return any(kw in nm for kw in ["nhan vien", "staff", "nhan su"])
+    return any(kw in nm for kw in [
+        "nhan vien", "staff", "nhan su",
+        "quan ly ca", "vai tro", "len lam", "nang cap chuc", "thang chuc",
+    ])
 
 def _is_admin_customer_q(nm: str) -> bool:
     return any(kw in nm for kw in ["khach hang", "khach", "nguoi dung", "user", "tai khoan"])
@@ -479,26 +482,116 @@ def _food(message: str, nm: str, now: datetime) -> dict:
         return {"reply": f"Lỗi tải đồ ăn: {e}", "actions": []}
 
 
-def _staff() -> dict:
-    sql = "SELECT Role, FullName FROM Staffs ORDER BY Role, FullName"
+_ROLE_CHANGE_KW = ["len lam", "nang cap", "thang chuc", "doi vai tro", "giao chuc vu", "chuyen sang vai tro"]
+
+# Map từ keyword (dạng đã normalize) → tên vai trò lưu trong DB
+_ROLE_MAP = {
+    "quan ly ca":       "Quản lý ca",
+    "quan ly":          "Quản lý ca",
+    "nhan vien ban ve": "Nhân viên bán vé",
+    "nhan vien":        "Nhân viên bán vé",
+}
+
+
+def _staff(message: str, nm: str) -> dict:
+    # Nếu người dùng muốn thay đổi vai trò → chuyển sang _staff_set_role
+    if any(kw in nm for kw in _ROLE_CHANGE_KW):
+        return _staff_set_role(message, nm)
+
+    sql = "SELECT Id, Role, FullName FROM Staff ORDER BY Role, FullName"
     try:
         with get_conn() as conn:
             c = conn.cursor()
-            c.execute(sql); rows = c.fetchall()
+            c.execute(sql)
+            rows = c.fetchall()
 
         from collections import Counter
         role_counts = Counter(r.Role or "Chưa rõ vai trò" for r in rows)
-        recent = [f"{r.FullName} ({r.Role})" for r in reversed(rows)][:5]
+        recent = [f"{r.FullName} (ID:{r.Id}, {r.Role or '—'})" for r in rows[-5:]]
 
-        lines = [f"Tổng hợp nhân viên:", f"- Tổng nhân viên: {len(rows)}."]
-        for role, cnt in role_counts.items():
+        lines = ["Tổng hợp nhân viên:", f"- Tổng: {len(rows)} người."]
+        for role, cnt in sorted(role_counts.items()):
             lines.append(f"- {role}: {cnt} người.")
         if recent:
-            lines.append("Nhân sự gần đây: " + ", ".join(recent) + ".")
+            lines.append("Danh sách gần đây: " + ", ".join(recent) + ".")
+        lines.append("(Để thay đổi vai trò: 'cho nhân viên ID X lên làm quản lý ca')")
 
-        return {"reply": "\n".join(lines), "actions": [_admin_action("Quản lý nhân viên", "Staff"), _admin_action("Chấm công", "Attendance")]}
+        return {
+            "reply": "\n".join(lines),
+            "actions": [_admin_action("Quản lý nhân viên", "Staff"), _admin_action("Chấm công", "Attendance")],
+        }
     except Exception as e:
         return {"reply": f"Lỗi tải nhân viên: {e}", "actions": []}
+
+
+def _staff_set_role(message: str, nm: str) -> dict:
+    import re
+
+    # 1. Xác định vai trò mới
+    new_role = None
+    for kw, role in _ROLE_MAP.items():
+        if kw in nm:
+            new_role = role
+            break
+
+    if new_role is None:
+        return {
+            "reply": "Vui lòng cho biết vai trò muốn gán.\nVí dụ: 'Quản lý ca' hoặc 'Nhân viên bán vé'.",
+            "actions": [],
+        }
+
+    # 2. Tìm nhân viên theo ID hoặc tên
+    id_match   = re.search(r'\bid\s*[=:]?\s*(\d+)', message, re.IGNORECASE)
+    # Tìm tên sau từ "tên" / "ten" / "có tên"
+    name_match = re.search(r'(?:co\s+)?ten\s+(\S+)', nm)
+
+    try:
+        with get_conn() as conn:
+            c = conn.cursor()
+
+            if id_match:
+                staff_id = int(id_match.group(1))
+                c.execute("SELECT Id, FullName, Role FROM Staff WHERE Id = ?", staff_id)
+                staff = c.fetchone()
+                if staff is None:
+                    return {"reply": f"Không tìm thấy nhân viên với ID {staff_id}.", "actions": []}
+
+            elif name_match:
+                keyword = name_match.group(1).strip()
+                c.execute("SELECT Id, FullName, Role FROM Staff WHERE FullName LIKE ?", f"%{keyword}%")
+                rows = c.fetchall()
+                if not rows:
+                    return {"reply": f"Không tìm thấy nhân viên có tên chứa '{keyword}'.", "actions": []}
+                if len(rows) > 1:
+                    names = ", ".join(f"{r.FullName} (ID:{r.Id})" for r in rows)
+                    return {
+                        "reply": f"Tìm thấy {len(rows)} nhân viên: {names}.\nVui lòng chỉ định thêm ID để chính xác hơn.",
+                        "actions": [],
+                    }
+                staff = rows[0]
+
+            else:
+                return {
+                    "reply": "Vui lòng cung cấp ID hoặc tên nhân viên.\nVí dụ: 'cho nhân viên ID 6 lên làm quản lý ca'.",
+                    "actions": [],
+                }
+
+            # 3. Cập nhật vai trò
+            old_role = staff.Role or "Chưa rõ"
+            c.execute("UPDATE Staff SET Role = ? WHERE Id = ?", new_role, staff.Id)
+            conn.commit()
+
+        return {
+            "reply": (
+                f"✅ Đã cập nhật vai trò thành công!\n"
+                f"- Nhân viên: {staff.FullName} (ID: {staff.Id})\n"
+                f"- Vai trò cũ: {old_role}\n"
+                f"- Vai trò mới: {new_role}"
+            ),
+            "actions": [_admin_action("Quản lý nhân viên", "Staff")],
+        }
+    except Exception as e:
+        return {"reply": f"Lỗi cập nhật vai trò: {e}", "actions": []}
 
 
 def _customers(message: str, nm: str, now: datetime) -> dict:
@@ -614,7 +707,7 @@ def _project_data(now: datetime) -> dict:
           (SELECT COUNT(*) FROM BookingSeats) AS booking_seats,
           (SELECT COUNT(*) FROM BookingConcessions) AS booking_concs,
           (SELECT COUNT(*) FROM Users)        AS users,
-          (SELECT COUNT(*) FROM Staffs)       AS staffs,
+          (SELECT COUNT(*) FROM Staff)        AS staffs,
           (SELECT COUNT(*) FROM FoodAndDrinks) AS foods
     """
     try:
@@ -1404,7 +1497,7 @@ def try_build_admin_reply(message: str, role: Optional[str], now: datetime, user
     if _is_admin_food_q(nm):
         return _food(message, nm, now)
     if _is_admin_staff_q(nm):
-        return _staff()
+        return _staff(message, nm)
     if _is_admin_customer_q(nm):
         return _customers(message, nm, now)
 

@@ -17,16 +17,32 @@ def _staff_action(label: str, action: str) -> dict:
     return {"type": "open_url", "label": label, "url": f"/Staff/Staff/{action}"}
 
 
-_STAFF_ROLES = {"admin", "staff", "shiftmanager"}
-_SHIFTMANAGER_ROLES = {"admin", "shiftmanager"}
+# Normalized role names (after calling normalize()) that count as staff/shiftmanager.
+# C# stores Vietnamese role strings like "Quản lý ca", "Nhân viên bán vé" in the DB.
+# normalize() strips diacritics → "quan ly ca", "nhan vien ban ve", "admin".
+_STAFF_ROLES = {
+    "admin",
+    "staff",
+    "shiftmanager",
+    "quan ly ca",          # Quản lý ca
+    "nhan vien ban ve",    # Nhân viên bán vé
+    "nhan vien",           # Nhân viên (generic)
+    "quan ly",             # Quản lý (generic)
+}
+_SHIFTMANAGER_ROLES = {
+    "admin",
+    "shiftmanager",
+    "quan ly ca",          # Quản lý ca
+    "quan ly",             # Quản lý (generic)
+}
 
 
 def _is_staff_auth(role: Optional[str]) -> bool:
-    return bool(role) and role.lower() in _STAFF_ROLES
+    return bool(role) and normalize(role) in _STAFF_ROLES
 
 
 def _is_shiftmanager(role: Optional[str]) -> bool:
-    return bool(role) and role.lower() in _SHIFTMANAGER_ROLES
+    return bool(role) and normalize(role) in _SHIFTMANAGER_ROLES
 
 
 # ─────────────────────────────────────────────────────────────────────────────
