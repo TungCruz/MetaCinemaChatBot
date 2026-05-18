@@ -969,6 +969,9 @@ def _is_bulk_create_q(nm: str) -> bool:
 
 
 def _is_all_now_showing_q(nm: str) -> bool:
+    # "phim bất kỳ" / "phim nào cũng được" → treat as all now-showing
+    if any(kw in nm for kw in ["phim bat ky", "bat ky phim", "phim nao cung", "phim gi cung"]):
+        return True
     mentions_all = any(kw in nm for kw in ["tat ca", "cac phim", "moi phim", "tung phim"])
     return (mentions_all and "phim" in nm
             and any(kw in nm for kw in ["dang chieu", "hien dang chieu", "now showing"]))
@@ -1302,18 +1305,22 @@ def _delete_showtimes(message: str, nm: str, now: datetime) -> dict:
     day_start = requested.replace(hour=0, minute=0, second=0)
     day_end   = day_start + timedelta(days=1)
 
-    # Tìm suất trong ngày
+    # Tìm suất trong ngày (dùng derived table thay correlated subquery để tránh lỗi pymssql)
     sql_find = """
-        SELECT s.Id, s.StartTime, ISNULL(m.Title,'Phim chua ro') AS title,
-               ISNULL(r.Name,'N/A') AS room_name,
-               (SELECT COUNT(*) FROM BookingSeats bs
-                INNER JOIN Bookings b ON b.Id = bs.BookingId
-                WHERE b.ShowtimeId = s.Id
-                  AND b.PaymentStatus IN ('Paid','PendingPayment','CheckedIn')
-               ) AS sold_seats
+        SELECT s.Id, s.StartTime,
+               ISNULL(m.Title, N'Phim chua ro') AS title,
+               ISNULL(r.Name, N'N/A') AS room_name,
+               ISNULL(sold.cnt, 0) AS sold_seats
         FROM Showtimes s
         LEFT JOIN Movies m ON m.Id = s.MovieId
         LEFT JOIN Rooms  r ON r.Id = s.RoomId
+        LEFT JOIN (
+            SELECT b.ShowtimeId, COUNT(DISTINCT bs.Id) AS cnt
+            FROM Bookings b
+            INNER JOIN BookingSeats bs ON bs.BookingId = b.Id
+            WHERE b.PaymentStatus IN (N'Paid', N'PendingPayment', N'CheckedIn')
+            GROUP BY b.ShowtimeId
+        ) sold ON sold.ShowtimeId = s.Id
         WHERE s.StartTime >= ? AND s.StartTime < ?
         ORDER BY s.StartTime
     """
