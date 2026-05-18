@@ -5,7 +5,7 @@ Uses pymssql (no system ODBC driver required, works on Render Linux).
 import os
 import re
 import pymssql
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 
 _DAY_NAMES = {
@@ -133,10 +133,11 @@ def get_conn():
 # ─────────────────────────────────────────────────────────────────────────────
 #  Movie context — port of BuildMovieContext(DateTime nowVn)
 # ─────────────────────────────────────────────────────────────────────────────
+_VN_TZ = timezone(timedelta(hours=7))
+
 def get_movie_context(now: datetime = None) -> str:
     if now is None:
-        from datetime import timezone, timedelta as _td
-        now = datetime.now(timezone(_td(hours=7))).replace(tzinfo=None)
+        now = datetime.now(_VN_TZ).replace(tzinfo=None)
     today    = now.date()
     tomorrow = today + timedelta(days=1)
     cutoff   = today + timedelta(days=8)

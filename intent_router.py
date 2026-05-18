@@ -109,19 +109,23 @@ _SYNONYM_GROUPS: list[tuple[list[str], str]] = [
 ]
 
 
-def expand_synonyms(nm: str) -> str:
-    """Thêm canonical keywords vào cuối nm cho bất kỳ synonym nào được nhận ra.
+def _apply_synonyms(nm: str, groups: list[tuple[list[str], str]]) -> str:
+    """Shared loop: append canonical keywords from a synonym group table to nm."""
+    extras = [c for variants, c in groups if c not in nm and any(v in nm for v in variants)]
+    return (nm + " " + " ".join(extras)) if extras else nm
 
-    Chỉ append canonical nếu chưa có trong nm, tránh trùng lặp.
-    Dùng sau normalize() — nm đã ở dạng chuẩn (không dấu, lowercase).
-    """
-    extras: list[str] = []
-    for variants, canonical in _SYNONYM_GROUPS:
-        if canonical not in nm and any(v in nm for v in variants):
-            extras.append(canonical)
-    if not extras:
-        return nm
-    return nm + " " + " ".join(extras)
+
+def expand_synonyms(nm: str) -> str:
+    """Áp dụng _SYNONYM_GROUPS (customer context) vào nm đã normalize."""
+    return _apply_synonyms(nm, _SYNONYM_GROUPS)
+
+
+# Keywords that signal an explicit "how-to" booking question
+# (used in try_build_routed_reply to prioritise booking guide over showtime)
+_GUIDANCE_HINTS: list[str] = [
+    "huong dan", "cach dat", "cach mua", "nhu the nao de",
+    "lam sao", "buoc", "quy trinh", "tu dat ve", "tu mua ve",
+]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -666,10 +670,8 @@ def try_build_routed_reply(message: str, page_context: dict, user_id: Optional[i
     if is_seat_status_question(nm):
         return _build_seat_status_reply(message, now)
 
-    # Booking guide takes priority over showtime for explicit "how-to" questions
-    # (prevents "hướng dẫn đặt vé" from being captured by showtime detector)
-    _GUIDANCE_HINTS = ["huong dan", "cach dat", "cach mua", "nhu the nao de", "lam sao",
-                       "buoc", "quy trinh", "tu dat ve", "tu mua ve"]
+    # Booking guide takes priority over showtime when user asks "how to" buy tickets
+    # (prevents "hướng dẫn đặt vé" from being captured by showtime detector first)
     if is_booking_guide_question(nm) and any(kw in nm for kw in _GUIDANCE_HINTS):
         return _build_booking_guide_reply(page_context, now)
 

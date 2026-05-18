@@ -10,7 +10,7 @@ import re
 from datetime import datetime, timedelta
 from typing import Optional
 from db import get_conn
-from intent_router import normalize, expand_synonyms, extract_requested_date
+from intent_router import normalize, expand_synonyms, _apply_synonyms, extract_requested_date
 from admin_router import (
     _build_report_range, _fmt_money, _vn_to_utc,
     _counter_sales, _payment, _food,
@@ -72,12 +72,8 @@ _STAFF_SYNONYM_GROUPS: list[tuple[list[str], str]] = [
 
 
 def _expand_staff(nm: str) -> str:
-    """Thêm canonical keywords staff-specific vào nm."""
-    extras: list[str] = []
-    for variants, canonical in _STAFF_SYNONYM_GROUPS:
-        if canonical not in nm and any(v in nm for v in variants):
-            extras.append(canonical)
-    return nm + (" " + " ".join(extras) if extras else "")
+    """Áp dụng _STAFF_SYNONYM_GROUPS (staff context) vào nm đã expand_synonyms."""
+    return _apply_synonyms(nm, _STAFF_SYNONYM_GROUPS)
 
 
 def _staff_action(label: str, action: str) -> dict:

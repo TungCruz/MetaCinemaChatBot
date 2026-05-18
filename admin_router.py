@@ -6,7 +6,7 @@ import re
 from datetime import datetime, timedelta, date as date_type, time as dt_time
 from typing import Optional
 from db import get_conn
-from intent_router import normalize, expand_synonyms, extract_requested_date
+from intent_router import normalize, expand_synonyms, _apply_synonyms, extract_requested_date
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -82,12 +82,8 @@ _ADMIN_SYNONYM_GROUPS: list[tuple[list[str], str]] = [
 
 
 def _expand_admin(nm: str) -> str:
-    """Thêm canonical keywords admin-specific vào nm."""
-    extras: list[str] = []
-    for variants, canonical in _ADMIN_SYNONYM_GROUPS:
-        if canonical not in nm and any(v in nm for v in variants):
-            extras.append(canonical)
-    return nm + (" " + " ".join(extras) if extras else "")
+    """Áp dụng _ADMIN_SYNONYM_GROUPS (admin context) vào nm đã expand_synonyms."""
+    return _apply_synonyms(nm, _ADMIN_SYNONYM_GROUPS)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1479,15 +1475,12 @@ def _bulk_create_showtime(message: str, nm: str, now: datetime, user_id) -> dict
     """Port of BuildAdminBulkCreateShowtimeReply."""
     per_day_count = _extract_bulk_per_day(nm)
     total_count = None if per_day_count is not None else _extract_bulk_total(nm)
-    all_now_showing = _is_all_now_showing_q(nm)
-    movie_id = None if all_now_showing else _resolve_movie_id(nm)
-    implicit_all_now_showing = (
-        not all_now_showing
-        and movie_id is None
-        and (per_day_count is not None or total_count is not None)
-    )
+    movie_id = None if _is_all_now_showing_q(nm) else _resolve_movie_id(nm)
+    # resolve_all: explicit "all movies" request OR no specific movie found but a count was given
+    resolve_all = (movie_id is None and (per_day_count is not None or total_count is not None
+                                          or _is_all_now_showing_q(nm)))
 
-    if all_now_showing or implicit_all_now_showing:
+    if resolve_all:
         target_movies = _load_now_showing_movies(now)
         movie_label = f"tất cả phim đang chiếu ({len(target_movies)} phim)"
     else:
@@ -1513,7 +1506,7 @@ def _bulk_create_showtime(message: str, nm: str, now: datetime, user_id) -> dict
 
     missing = []
     if not target_movies:
-        missing.append("tất cả phim đang chiếu" if (all_now_showing or implicit_all_now_showing) else "phim")
+        missing.append("tất cả phim đang chiếu" if resolve_all else "phim")
     if per_day_count is None and total_count is None:
         missing.append("số suất cần tạo")
 

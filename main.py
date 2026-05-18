@@ -5,6 +5,7 @@ from typing import Optional
 from datetime import datetime, timezone, timedelta
 import os
 import time
+import threading
 from dotenv import load_dotenv
 
 from db import get_movie_context, get_food_context, get_knowledge_context
@@ -17,15 +18,21 @@ load_dotenv()
 
 _INTERNAL_SECRET = os.getenv("CHATBOT_INTERNAL_SECRET", "")
 
-# ── Simple TTL cache for Gemini context (avoid 3 DB hits per fallback message) ──
+_MAX_HISTORY = 20  # Gemini token budget: keep last 10 turns
+
+# TTL cache for Gemini context (avoids 3 DB hits per fallback message)
 _ctx_cache: dict[str, tuple[float, str]] = {}
+_ctx_lock = threading.Lock()
 
 def _cached_ctx(key: str, fn, ttl: int) -> str:
-    ts, val = _ctx_cache.get(key, (0.0, ""))
-    if time.monotonic() - ts < ttl:
-        return val
+    with _ctx_lock:
+        ts, val = _ctx_cache.get(key, (0.0, ""))
+        if time.monotonic() - ts < ttl:
+            return val
+    # Compute outside lock so slow DB calls don't block other requests
     val = fn()
-    _ctx_cache[key] = (time.monotonic(), val)
+    with _ctx_lock:
+        _ctx_cache[key] = (time.monotonic(), val)
     return val
 
 app = FastAPI(title="MetaCinema Chatbot Service", version="1.0.0")
@@ -103,8 +110,6 @@ def chat(req: ChatRequest, request: Request):
 
     system_prompt = build_system_prompt(movie_context, food_context, knowledge_context)
 
-    # Limit history to last 20 messages (10 turns) to avoid Gemini token overflow
-    trimmed_history = req.history[-20:] if len(req.history) > 20 else req.history
-    reply = call_gemini(api_key, system_prompt, trimmed_history, message)
+    reply = call_gemini(api_key, system_prompt, req.history[-_MAX_HISTORY:], message)
 
     return ChatResponse(reply=reply)
