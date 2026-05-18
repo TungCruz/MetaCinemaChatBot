@@ -38,10 +38,16 @@ def _cached_ctx(key: str, fn, ttl: int) -> str:
         ts, val = _ctx_cache.get(key, (0.0, ""))
         if time.monotonic() - ts < ttl:
             return val
-    # Compute outside lock so slow DB calls don't block other requests
+    # Compute outside lock — slow DB call doesn't block other requests.
+    # Multiple threads may compute concurrently on a cold cache, but the
+    # inner check below ensures only the first stale result is stored.
     val = fn()
     with _ctx_lock:
-        _ctx_cache[key] = (time.monotonic(), val)
+        existing_ts, existing_val = _ctx_cache.get(key, (0.0, ""))
+        if time.monotonic() - existing_ts >= ttl:  # still stale → store ours
+            _ctx_cache[key] = (time.monotonic(), val)
+        else:
+            val = existing_val  # another thread already refreshed it
     return val
 
 app = FastAPI(title="MetaCinema Chatbot Service", version="1.0.0")
@@ -128,11 +134,11 @@ def chat(req: ChatRequest, request: Request):
     knowledge_context = _cached_ctx("knowledge", get_knowledge_context,             600)
 
     # Add context hint to Gemini if user was discussing a specific movie
+    # Reuse sess from the earlier session_store.get() — no second call needed
     page_note = ""
-    if req.user_id or req.session_token:
-        last_title = session_store.get(user_id=req.user_id, session_token=req.session_token).get("last_movie_title", "")
-        if last_title:
-            page_note = f"User vừa hỏi về phim **{last_title}** — ưu tiên trả lời liên quan đến phim này nếu không có yêu cầu khác."
+    last_title = sess.get("last_movie_title", "")
+    if last_title:
+        page_note = f"User vừa hỏi về phim **{last_title}** — ưu tiên trả lời liên quan đến phim này nếu không có yêu cầu khác."
 
     system_prompt = build_system_prompt(movie_context, food_context, knowledge_context, page_note)
 

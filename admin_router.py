@@ -3,10 +3,12 @@ Port of ChatController.cs BuildAdminReply and sub-methods.
 Auth: C# passes role from Session["StaffRole"] → Python trusts it (C# is auth gatekeeper).
 """
 import re
+import json
+import session_store
 from datetime import datetime, timedelta, date as date_type, time as dt_time
 from typing import Optional
 from db import get_conn
-from intent_router import normalize, expand_synonyms, _apply_synonyms, extract_requested_date
+from intent_router import normalize, expand_synonyms, _apply_synonyms, extract_requested_date, _format_room
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -428,7 +430,7 @@ def _showtime(message: str, now: datetime) -> dict:
         else:
             for s in rows[:8]:
                 total = int(s.total_seats or 0); sold = int(s.sold_seats or 0)
-                room = s.room_name if normalize(s.room_name).startswith("phong") else f"Phòng {s.room_name}"
+                room = _format_room(s.room_name)
                 lines.append(f"- {s.StartTime.strftime('%H:%M')} | {s.title} | {room} | đã bán/giữ {sold}/{total}")
             if len(rows) > 8:
                 lines.append(f"Còn {len(rows)-8} suất khác trong ngày.")
@@ -516,13 +518,13 @@ def _rooms(now: datetime) -> dict:
 
         lines = ["Tổng hợp phòng chiếu:"]
         for r in rooms:
-            name = r.Name if normalize(r.Name).startswith("phong") else f"Phòng {r.Name}"
+            name = _format_room(r.Name)
             lines.append(f"- {name}: {r.status}, {r.active_seats} ghế hoạt động, {r.shows_today} suất hôm nay.")
         if busy:
             lines.append("Suất lấp đầy cao hôm nay:")
             for s in busy:
                 total = int(s.total or 0); sold = int(s.sold or 0); avail = total - sold
-                room = s.room_name if normalize(s.room_name).startswith("phong") else f"Phòng {s.room_name}"
+                room = _format_room(s.room_name)
                 lines.append(f"- {s.StartTime.strftime('%H:%M')} {room} | {s.title} | còn {avail}/{total} ghế.")
 
         return {"reply": "\n".join(lines), "actions": [_admin_action("Quản lý phòng", "Rooms")]}
@@ -1072,7 +1074,6 @@ def _parse_plan_datetimes(plan: dict) -> dict:
 
 
 def _get_pending_plan(user_id) -> Optional[dict]:
-    import session_store
     tok = _plan_token(user_id)
     sess = session_store.get(session_token=tok)
     raw = sess.get("plan")
@@ -1087,12 +1088,12 @@ def _get_pending_plan(user_id) -> Optional[dict]:
 
 
 def _set_pending_plan(user_id, items: list, price_note: str, start, end):
-    import json, session_store
     tok = _plan_token(user_id)
     # Serialize datetimes to strings for JSON-safe storage
-    raw_items = json.loads(json.dumps(
-        [dict(it) for it in items], default=_dt_to_str, ensure_ascii=False
-    ))
+    raw_items = [
+        {k: (_dt_to_str(v) if isinstance(v, datetime) else v) for k, v in dict(it).items()}
+        for it in items
+    ]
     session_store.update(session_token=tok, data={"plan": {
         "items": raw_items,
         "price_note": price_note,
@@ -1103,7 +1104,6 @@ def _set_pending_plan(user_id, items: list, price_note: str, start, end):
 
 
 def _clear_pending_plan(user_id):
-    import session_store
     tok = _plan_token(user_id)
     session_store.update(session_token=tok, data={"plan": None})
 
@@ -1285,7 +1285,7 @@ def _build_bulk_plan(movies, rooms, start_date, days, per_day_count, total_count
 
 
 def _fmt_item(item) -> str:
-    room_name = item["room_name"] if normalize(item["room_name"]).startswith("phong") else f"Phòng {item['room_name']}"
+    room_name = _format_room(item["room_name"])
     return f"{item['start_time'].strftime('%d/%m/%Y %H:%M')} | {item['movie_title']} | {room_name} | {_fmt_money(item['price'])}"
 
 
@@ -1389,7 +1389,7 @@ def _delete_showtimes(message: str, nm: str, now: datetime) -> dict:
     if not can_delete:
         lines = [f"Không thể xóa: tất cả {len(rows)} suất ngày {day_start.strftime('%d/%m/%Y')} đều đã có vé đặt."]
         for r in has_tickets[:5]:
-            room = r.room_name if normalize(r.room_name).startswith("phong") else f"Phòng {r.room_name}"
+            room = _format_room(r.room_name)
             lines.append(f"- {r.StartTime.strftime('%H:%M')} | {r.title} | {room} | {r.sold_seats} vé")
         return {"reply": "\n".join(lines), "actions": [_admin_action("Quản lý suất chiếu", "Showtimes")]}
 
@@ -1405,7 +1405,7 @@ def _delete_showtimes(message: str, nm: str, now: datetime) -> dict:
 
     lines = [f"Đã xóa {len(can_delete)} suất chiếu ngày {day_start.strftime('%d/%m/%Y')}."]
     for r in can_delete[:8]:
-        room = r.room_name if normalize(r.room_name).startswith("phong") else f"Phòng {r.room_name}"
+        room = _format_room(r.room_name)
         lines.append(f"- {r.StartTime.strftime('%H:%M')} | {r.title} | {room}")
     if has_tickets:
         lines.append(f"Giữ lại {len(has_tickets)} suất đã có vé đặt (không thể xóa).")
@@ -1452,7 +1452,7 @@ def _create_showtime(message: str, nm: str, now: datetime) -> dict:
         }
 
     if room_dict.get("status") in ("Bảo trì", "Tạm đóng"):
-        room_name = room_dict["name"] if normalize(room_dict["name"]).startswith("phong") else f"Phòng {room_dict['name']}"
+        room_name = _format_room(room_dict["name"])
         return {
             "reply": f"{room_name} đang ở trạng thái \"{room_dict['status']}\", không thể tạo suất chiếu. Vui lòng chọn phòng khác hoặc cập nhật trạng thái phòng.",
             "actions": [_admin_action("Quản lý phòng", "Rooms")],
@@ -1488,7 +1488,7 @@ def _create_showtime(message: str, nm: str, now: datetime) -> dict:
         separated = (start_time >= ex_end + timedelta(minutes=30)
                      or ex.StartTime >= new_end + timedelta(minutes=30))
         if not separated:
-            room_name = room_dict["name"] if normalize(room_dict["name"]).startswith("phong") else f"Phòng {room_dict['name']}"
+            room_name = _format_room(room_dict["name"])
             return {
                 "reply": (f"Không tạo được vì trùng lịch với phim \"{ex.title}\" tại {room_name}, "
                           f"khung {ex.StartTime.strftime('%d/%m/%Y %H:%M')} - {ex_end.strftime('%H:%M')}. "
@@ -1507,7 +1507,7 @@ def _create_showtime(message: str, nm: str, now: datetime) -> dict:
     except Exception as e:
         return {"reply": f"Lỗi tạo suất chiếu: {e}", "actions": [_admin_action("Quản lý suất chiếu", "Showtimes")]}
 
-    room_name = room_dict["name"] if normalize(room_dict["name"]).startswith("phong") else f"Phòng {room_dict['name']}"
+    room_name = _format_room(room_dict["name"])
     return {
         "reply": (f"Đã tạo suất chiếu thành công:\n"
                   f"- Phim: {movie.Title}\n"
@@ -1615,14 +1615,11 @@ def _bulk_create_showtime(message: str, nm: str, now: datetime, user_id) -> dict
                   else "Giá vé tự lấy theo suất gần nhất của từng phim; phim chưa có suất dùng 70.000đ.")
     _set_pending_plan(user_id, plan_items, price_note, start_date, end_date)
 
-    def _fmt_room_name(r):
-        return r["name"] if normalize(r["name"]).startswith("phong") else f"Phòng {r['name']}"
-
     lines = [
         f"Mình đã lập kế hoạch tạo {len(plan_items)}/{est_total} suất chiếu.",
         f"- Khoảng ngày: {start_date.strftime('%d/%m/%Y')} - {end_date.strftime('%d/%m/%Y')}.",
         f"- Phim: {movie_label}.",
-        f"- Phòng dùng: {', '.join(_fmt_room_name(r) for r in rooms)}.",
+        f"- Phòng dùng: {', '.join(_format_room(r['name']) for r in rooms)}.",
         f"- {price_note}",
         "Các suất dự kiến:",
     ]

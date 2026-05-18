@@ -4,7 +4,9 @@ Admin/staff intents are still handled by C# (not ported yet).
 """
 import logging
 import re
+import time as _time
 import unicodedata
+from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Optional
 from db import get_conn
@@ -151,6 +153,13 @@ _MOVIE_REF_WORDS: list[str] = [
     "bo phim do", "phim vua noi", "cai phim do",
 ]
 
+# Words that signal a recommendation/review context — policy detector defers to Gemini for these
+_RECOMMEND_WORDS: list[str] = [
+    "goi y", "nen xem", "phu hop", "co hay khong", "hay khong",
+    "danh gia", "review", "nen di", "nen chon", "thich hop",
+    "cho tre em", "danh cho", "de xem", "xem cung", "nhat cho",
+]
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Intent detectors — port of Is*Question() methods
@@ -175,7 +184,7 @@ def is_seat_status_question(nm: str) -> bool:
 
 
 def is_movie_question(nm: str) -> bool:
-    # Only match "list all movies" queries — specific questions about a movie go to Gemini
+    # Matches list-all-movies queries and specific movie-info keywords; open-ended questions go to Gemini
     return asks_global_movie_list(nm) or any(kw in nm for kw in [
         "noi dung phim", "the loai", "dien vien", "dao dien",
         "phim hay", "review phim", "gioi thieu phim", "noi ve gi", "ke ve",
@@ -188,11 +197,6 @@ def is_food_question(nm: str) -> bool:
 
 def is_policy_question(nm: str) -> bool:
     # Exclude recommendation / review contexts — let Gemini handle those
-    _RECOMMEND_WORDS = [
-        "goi y", "nen xem", "phu hop", "co hay khong", "hay khong",
-        "danh gia", "review", "nen di", "nen chon", "thich hop",
-        "cho tre em", "danh cho", "de xem", "xem cung", "nhat cho",
-    ]
     if any(kw in nm for kw in _RECOMMEND_WORDS):
         return False
     return any(kw in nm for kw in [
@@ -396,7 +400,6 @@ def _build_showtime_reply(message: str, page_context: dict, now: datetime) -> Op
             "session_update": {"last_movie_id": page_movie_id, "last_movie_title": title},
         }
 
-    from collections import defaultdict
     by_movie = defaultdict(list)
     for r in rows:
         by_movie[r.MovieId].append(r)
@@ -561,7 +564,6 @@ def _build_food_reply(nm: str) -> dict:
 
         target = matched[:8] if matched else items[:10]
 
-        from collections import defaultdict
         by_cat = defaultdict(list)
         for f in target:
             by_cat[f.Category or "Khác"].append(f)
@@ -584,6 +586,28 @@ def _build_food_reply(nm: str) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 #  Policy reply
 # ─────────────────────────────────────────────────────────────────────────────
+_promo_cache: tuple[float, list] = (0.0, [])
+_PROMO_TTL = 300  # 5 minutes
+
+
+def _get_cached_promotions() -> list:
+    global _promo_cache
+    ts, items = _promo_cache
+    if _time.monotonic() - ts < _PROMO_TTL:
+        return items
+    try:
+        with get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT Title, Content FROM ChatbotKnowledge WHERE IsActive=1 ORDER BY SortOrder, Id"
+            )
+            items = cursor.fetchall()
+        _promo_cache = (_time.monotonic(), items)
+    except Exception:
+        pass  # return stale data on failure
+    return items
+
+
 def _build_policy_reply(nm: str) -> dict:
     if any(kw in nm for kw in ["hoan", "doi suat", "huy ve"]):
         return {"reply": "Vé đã thanh toán không hoàn tiền. Nếu cần đổi suất, liên hệ hotline 0799010072 trước giờ chiếu ít nhất 2 giờ.", "actions": []}
@@ -594,19 +618,13 @@ def _build_policy_reply(nm: str) -> dict:
     if any(kw in nm for kw in ["dia chi", "o dau"]):
         return {"reply": "Meta Cinema ở 06 Trần Văn Ơn, phường Phú Lợi, TP. Hồ Chí Minh. Hotline: 0799010072.", "actions": []}
     if any(kw in nm for kw in ["khuyen mai", "uu dai", "giam gia"]):
-        try:
-            with get_conn() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT Title, Content FROM ChatbotKnowledge WHERE IsActive=1 ORDER BY SortOrder, Id")
-                items = cursor.fetchall()
-            promotions = [k for k in items if any(
-                kw in normalize(k.Title + " " + k.Content) for kw in ["khuyen mai", "uu dai", "giam"]
-            )][:4]
-            if promotions:
-                lines = ["Khuyến mãi/ưu đãi hiện có:"] + [f"- {k.Title}: {k.Content}" for k in promotions]
-                return {"reply": "\n".join(lines), "actions": []}
-        except Exception:
-            pass
+        items = _get_cached_promotions()
+        promotions = [k for k in items if any(
+            kw in normalize(k.Title + " " + k.Content) for kw in ["khuyen mai", "uu dai", "giam"]
+        )][:4]
+        if promotions:
+            lines = ["Khuyến mãi/ưu đãi hiện có:"] + [f"- {k.Title}: {k.Content}" for k in promotions]
+            return {"reply": "\n".join(lines), "actions": []}
     return {"reply": "Với chính sách cụ thể, bạn có thể gọi hotline 0799010072 để được rạp xác nhận nhanh nhất.", "actions": []}
 
 
@@ -806,7 +824,7 @@ def try_build_routed_reply(message: str, page_context: dict, user_id: Optional[i
         logger.info("intent=food user=%s", user_id)
         return _build_food_reply(nm)
 
-    # Booking guide
+    # Catch-all for booking-guide questions that lack _GUIDANCE_HINTS keywords (e.g. bare "đặt vé")
     if is_booking_guide_question(nm):
         logger.info("intent=booking_guide user=%s", user_id)
         return _build_booking_guide_reply(page_context, now)

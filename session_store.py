@@ -152,7 +152,9 @@ def _db_load(key: str) -> dict | None:
 
 def _db_save(key: str, data: dict) -> None:
     """
-    Upsert a session into the DB (SELECT → UPDATE or INSERT pattern).
+    Upsert a session into the DB — race-safe UPDATE-first pattern.
+    Try UPDATE; if no row exists (rowcount == 0), INSERT and ignore any
+    primary-key violation from a concurrent writer.
     Swallows all exceptions — called from a daemon thread.
     """
     _ensure_table()
@@ -162,17 +164,20 @@ def _db_save(key: str, data: dict) -> None:
         from db import get_conn
         with get_conn() as conn:
             c = conn.cursor()
-            c.execute("SELECT 1 FROM ChatbotSessions WHERE SessionKey = ?", key)
-            if c.fetchone():
-                c.execute(
-                    "UPDATE ChatbotSessions SET SessionData = ?, UpdatedAt = ? WHERE SessionKey = ?",
-                    payload, now, key,
-                )
-            else:
-                c.execute(
-                    "INSERT INTO ChatbotSessions (SessionKey, SessionData, UpdatedAt) VALUES (?, ?, ?)",
-                    key, payload, now,
-                )
+            c.execute(
+                "UPDATE ChatbotSessions SET SessionData = ?, UpdatedAt = ? WHERE SessionKey = ?",
+                payload, now, key,
+            )
+            if c.rowcount == 0:
+                # No existing row — insert; ignore PK violation from concurrent writer
+                try:
+                    c.execute(
+                        "INSERT INTO ChatbotSessions (SessionKey, SessionData, UpdatedAt)"
+                        " VALUES (?, ?, ?)",
+                        key, payload, now,
+                    )
+                except Exception:
+                    pass  # concurrent INSERT by another worker — their write wins, ours lost
             conn.commit()
     except Exception as exc:
         logger.debug("session_store: DB write failed for key=%r: %s", key, exc)
@@ -273,3 +278,27 @@ def update(user_id=None, session_token=None, data: dict = None) -> None:
 
     # --- Async DB write ---
     _fire_db_save(key, merged)
+
+
+# ---------------------------------------------------------------------------
+# Background L1 cache cleanup — prevents unbounded growth from anonymous tokens
+# ---------------------------------------------------------------------------
+
+def _start_cleanup_thread() -> None:
+    """Evict expired L1 entries every 5 minutes (daemon — stops with process)."""
+    def _loop():
+        while True:
+            time.sleep(300)
+            cutoff = time.monotonic() - _SESSION_TTL
+            with _lock:
+                stale = [k for k, (ts, _) in _store.items() if ts < cutoff]
+                for k in stale:
+                    _store.pop(k, None)
+            if stale:
+                logger.debug("session_store: evicted %d expired L1 entries", len(stale))
+
+    t = threading.Thread(target=_loop, daemon=True, name="session-cleanup")
+    t.start()
+
+
+_start_cleanup_thread()
