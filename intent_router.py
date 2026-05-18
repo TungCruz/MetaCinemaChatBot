@@ -31,13 +31,16 @@ _SYNONYM_GROUPS: list[tuple[list[str], str]] = [
     (["ra rap", "den rap", "di rap", "muon di xem phim",
       "muon dat ve", "book ve", "dat cho", "mua cho",
       "buoi chieu", "phim chieu luc", "co suat nao", "bao gio chieu",
-      "khi nao chieu", "chieu o dau"], "lich chieu"),
+      "khi nao chieu", "chieu o dau", "lich toi nay",
+      "lich chieu toi nay", "co lich nao", "con lich nao"], "lich chieu"),
 
     # ── Danh sách phim đang chiếu ─────────────────────────────────────────
     (["xem gi", "xem phim gi", "co gi xem", "co gi hay",
       "hom nay co gi", "co gi chieu", "phim nao co",
       "dang co phim gi", "phim tuan nay", "cuoi tuan co gi",
-      "phim gi co", "co phim gi khong"], "phim gi"),
+      "phim gi co", "co phim gi khong", "toi nay chieu gi",
+      "toi nay xem gi", "hom nay chieu gi", "chieu nay co gi",
+      "dem nay co gi"], "phim gi"),
 
     # ── Nội dung / thông tin phim ─────────────────────────────────────────
     (["cot truyen", "tom tat phim", "tom tat noi dung",

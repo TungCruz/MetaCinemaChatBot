@@ -20,7 +20,9 @@ _ADMIN_SYNONYM_GROUPS: list[tuple[list[str], str]] = [
       "suat hom nay", "suat ngay", "lich tuan nay"], "lich chieu"),
     # Verb tạo lịch (trigger _is_create_showtime_q)
     (["lap lich", "xep lich", "len lich", "bo sung suat",
-      "tao moi suat", "lap suat", "tao lich chieu"], "tao"),
+      "tao moi suat", "lap suat", "tao lich chieu",
+      "them lich", "tao them", "bo sung lich", "sap lich",
+      "day them suat", "chay them suat"], "tao"),
     # Verb xóa (trigger _is_delete_showtime_q)
     (["huy suat", "xoa suat", "loai bo suat", "bo suat",
       "xoa lich", "huy lich chieu", "xoa het suat"], "xoa"),
@@ -965,7 +967,7 @@ def _is_bulk_create_q(nm: str) -> bool:
         return False
     return (any(kw in nm for kw in ["tat ca phim", "cac phim", "hang loat", "bulk", "moi ngay"])
             or bool(re.search(r"\b\d{1,2}\s*ngay\s*(?:toi|tiep theo|sap toi|ke tiep)\b", nm))
-            or bool(re.search(r"\b[2-9]\d*\s*suat(?:\s*chieu)?\b", nm)))
+            or bool(re.search(r"\b\d{1,2}\s*suat(?:\s*chieu)?\b", nm)))
 
 
 def _is_all_now_showing_q(nm: str) -> bool:
@@ -1475,13 +1477,20 @@ def _create_showtime(message: str, nm: str, now: datetime) -> dict:
 
 def _bulk_create_showtime(message: str, nm: str, now: datetime, user_id) -> dict:
     """Port of BuildAdminBulkCreateShowtimeReply."""
+    per_day_count = _extract_bulk_per_day(nm)
+    total_count = None if per_day_count is not None else _extract_bulk_total(nm)
     all_now_showing = _is_all_now_showing_q(nm)
+    movie_id = None if all_now_showing else _resolve_movie_id(nm)
+    implicit_all_now_showing = (
+        not all_now_showing
+        and movie_id is None
+        and (per_day_count is not None or total_count is not None)
+    )
 
-    if all_now_showing:
+    if all_now_showing or implicit_all_now_showing:
         target_movies = _load_now_showing_movies(now)
         movie_label = f"tất cả phim đang chiếu ({len(target_movies)} phim)"
     else:
-        movie_id = _resolve_movie_id(nm)
         target_movies = []
         movie_label = ""
         if movie_id:
@@ -1497,8 +1506,6 @@ def _bulk_create_showtime(message: str, nm: str, now: datetime, user_id) -> dict
             except Exception as e:
                 return {"reply": f"Lỗi tải phim: {e}", "actions": [_admin_action("Quản lý suất chiếu", "Showtimes")]}
 
-    per_day_count = _extract_bulk_per_day(nm)
-    total_count = None if per_day_count is not None else _extract_bulk_total(nm)
     days = _extract_bulk_days(nm)
     start_date = _resolve_bulk_start(message, nm, now)
     price = _extract_price(nm)
@@ -1506,7 +1513,7 @@ def _bulk_create_showtime(message: str, nm: str, now: datetime, user_id) -> dict
 
     missing = []
     if not target_movies:
-        missing.append("tất cả phim đang chiếu" if all_now_showing else "phim")
+        missing.append("tất cả phim đang chiếu" if (all_now_showing or implicit_all_now_showing) else "phim")
     if per_day_count is None and total_count is None:
         missing.append("số suất cần tạo")
 

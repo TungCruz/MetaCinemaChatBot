@@ -42,6 +42,11 @@ _STAFF_SYNONYM_GROUPS: list[tuple[list[str], str]] = [
       "dat ve tai quay", "pos", "tiep khach",
       "ban ve truc tiep", "thu tien khach"], "ban tai quay"),
 
+    # ── Xác thực vé / QR ─────────────────────────────────────────────────
+    (["quet ve", "quet qr", "check qr", "check ve", "kiem ve",
+      "kiem tra ma ve", "khach dua qr", "khach dua ma",
+      "ma booking", "ma ve khach"], "xac thuc ve"),
+
     # ── Phòng chiếu ──────────────────────────────────────────────────────
     (["phong chieu", "tinh trang phong",
       "phong bi loi", "phong nao dang chieu",
@@ -115,7 +120,10 @@ def _is_seat_status_q(nm: str) -> bool:
 
 
 def _is_showtime_q(nm: str) -> bool:
-    return any(kw in nm for kw in ["suat chieu", "lich chieu", "gio chieu", "lich hom nay", "lich ngay"])
+    return any(kw in nm for kw in [
+        "suat chieu", "lich chieu", "gio chieu", "lich hom nay",
+        "lich ngay", "suat nao", "nhung suat", "cac suat"
+    ])
 
 
 def _is_attendance_q(nm: str) -> bool:
@@ -124,6 +132,13 @@ def _is_attendance_q(nm: str) -> bool:
 
 def _is_counter_sale_q(nm: str) -> bool:
     return any(kw in nm for kw in ["ban tai quay", "quay ban", "ban truc tiep", "thu ngan", "counter"])
+
+
+def _is_ticket_validation_q(nm: str) -> bool:
+    return any(kw in nm for kw in [
+        "xac thuc ve", "quet ve", "quet qr", "check qr", "check ve",
+        "kiem ve", "ma ve", "qr ve", "ma booking", "validate ticket"
+    ])
 
 
 def _is_room_q(nm: str) -> bool:
@@ -488,6 +503,20 @@ def _counter_sale_info() -> dict:
     }
 
 
+def _ticket_validation_info() -> dict:
+    lines = [
+        "Xác thực vé nhanh:",
+        "1. Vào màn hình Xác thực vé.",
+        "2. Quét QR hoặc nhập mã vé dạng BKG-xxxxxx.",
+        "3. Kiểm tra trạng thái hợp lệ, phim, suất chiếu, phòng và ghế.",
+        "4. Nếu vé hợp lệ, xác nhận khách vào rạp; nếu không hợp lệ, kiểm tra lại lịch sử thanh toán/booking.",
+    ]
+    return {
+        "reply": "\n".join(lines),
+        "actions": [_staff_action("Xác thực vé", "Index")],
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Main entry point
 # ─────────────────────────────────────────────────────────────────────────────
@@ -536,6 +565,10 @@ def try_build_staff_reply(message: str, role: Optional[str], now: datetime) -> O
         if is_manager:
             return _counter_sales(message, nm, now)
         return _counter_sale_info()
+
+    # ── Xác thực vé / QR ───────────────────────────────────────────────────
+    if _is_ticket_validation_q(nm):
+        return _ticket_validation_info()
 
     # ── Phòng chiếu ──────────────────────────────────────────────────────────
     if _is_room_q(nm):
