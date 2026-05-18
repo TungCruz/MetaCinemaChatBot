@@ -80,7 +80,7 @@ _SYNONYM_GROUPS: list[tuple[list[str], str]] = [
     (["sale", "voucher", "ma giam", "giam gia",
       "discount", "ma uu dai", "ma khuyen mai"], "khuyen mai"),
     (["bao nhieu tuoi", "may tuoi", "gioi han tuoi",
-      "tuoi toi thieu", "tre em", "kiem tra tuoi"], "do tuoi"),
+      "tuoi toi thieu", "kiem tra tuoi", "quy dinh tuoi"], "do tuoi"),
 
     # ── Vé của tôi ───────────────────────────────────────────────────────
     (["xem ve", "kiem tra ve", "check ve", "ve cua minh",
@@ -177,7 +177,9 @@ def is_seat_status_question(nm: str) -> bool:
 def is_movie_question(nm: str) -> bool:
     return asks_global_movie_list(nm) or any(kw in nm for kw in [
         "noi dung phim", "the loai", "dien vien", "dao dien",
-        "phim hay", "review phim", "gioi thieu phim", "noi ve gi", "ke ve"
+        "phim hay", "review phim", "gioi thieu phim", "noi ve gi", "ke ve",
+        "phu hop voi", "co hay khong", "nen xem", "danh gia phim",
+        "cho tre em", "cho gia dinh", "cho cap doi", "cho nguoi lon",
     ])
 
 
@@ -186,6 +188,14 @@ def is_food_question(nm: str) -> bool:
 
 
 def is_policy_question(nm: str) -> bool:
+    # Exclude recommendation / review contexts — let Gemini handle those
+    _RECOMMEND_WORDS = [
+        "goi y", "nen xem", "phu hop", "co hay khong", "hay khong",
+        "danh gia", "review", "nen di", "nen chon", "thich hop",
+        "cho tre em", "danh cho", "de xem", "xem cung", "nhat cho",
+    ]
+    if any(kw in nm for kw in _RECOMMEND_WORDS):
+        return False
     return any(kw in nm for kw in [
         "chinh sach", "quy dinh", "hoan tien", "huy ve", "doi suat", "doi ve",
         "c18", "c16", "do tuoi", "mang do an", "khuyen mai", "uu dai", "hotline", "dia chi"
