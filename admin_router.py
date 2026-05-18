@@ -1029,36 +1029,83 @@ def _load_now_showing_movies(now: datetime) -> list:
 #  Bulk scheduling algorithm
 # ─────────────────────────────────────────────────────────────────────────────
 
-# In-memory pending plan storage keyed by user_id (int, 0 = anonymous)
-_pending_plans: dict = {}
+# Pending bulk-create plan — backed by session_store for persistence across restarts.
+# Plans are keyed by a synthetic session token "plan_{user_id}" so they share
+# the ChatbotSessions DB table but never collide with regular user sessions.
+
 _PLAN_EXPIRE_MINUTES = 15
 
 
-def _plan_key(user_id) -> int:
-    return int(user_id) if user_id else 0
+def _plan_token(user_id) -> str:
+    return f"plan_{int(user_id) if user_id else 0}"
+
+
+def _dt_to_str(obj) -> str:
+    """Serialize a datetime to ISO string for JSON storage."""
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    return str(obj)
+
+
+def _parse_plan_datetimes(plan: dict) -> dict:
+    """Convert ISO-string datetimes back to datetime objects after JSON round-trip."""
+    plan = dict(plan)
+    for field in ("start", "end", "created_at"):
+        val = plan.get(field)
+        if isinstance(val, str):
+            try:
+                plan[field] = datetime.fromisoformat(val)
+            except ValueError:
+                pass
+    if isinstance(plan.get("items"), list):
+        fixed = []
+        for item in plan["items"]:
+            item = dict(item)
+            if isinstance(item.get("start_time"), str):
+                try:
+                    item["start_time"] = datetime.fromisoformat(item["start_time"])
+                except ValueError:
+                    pass
+            fixed.append(item)
+        plan["items"] = fixed
+    return plan
 
 
 def _get_pending_plan(user_id) -> Optional[dict]:
-    key = _plan_key(user_id)
-    plan = _pending_plans.get(key)
-    if plan is None:
+    import session_store
+    tok = _plan_token(user_id)
+    sess = session_store.get(session_token=tok)
+    raw = sess.get("plan")
+    if not raw:
         return None
-    if datetime.utcnow() - plan["created_at"] > timedelta(minutes=_PLAN_EXPIRE_MINUTES):
-        _pending_plans.pop(key, None)
+    plan = _parse_plan_datetimes(raw)
+    created = plan.get("created_at")
+    if isinstance(created, datetime) and datetime.utcnow() - created > timedelta(minutes=_PLAN_EXPIRE_MINUTES):
+        _clear_pending_plan(user_id)
         return None
     return plan
 
 
 def _set_pending_plan(user_id, items: list, price_note: str, start, end):
-    _pending_plans[_plan_key(user_id)] = {
-        "items": items, "price_note": price_note,
-        "start": start, "end": end,
-        "created_at": datetime.utcnow(),
-    }
+    import json, session_store
+    tok = _plan_token(user_id)
+    # Serialize datetimes to strings for JSON-safe storage
+    raw_items = json.loads(json.dumps(
+        [dict(it) for it in items], default=_dt_to_str, ensure_ascii=False
+    ))
+    session_store.update(session_token=tok, data={"plan": {
+        "items": raw_items,
+        "price_note": price_note,
+        "start": _dt_to_str(start),
+        "end": _dt_to_str(end),
+        "created_at": datetime.utcnow().isoformat(),
+    }})
 
 
 def _clear_pending_plan(user_id):
-    _pending_plans.pop(_plan_key(user_id), None)
+    import session_store
+    tok = _plan_token(user_id)
+    session_store.update(session_token=tok, data={"plan": None})
 
 
 def _load_schedule_slots(start: datetime, end: datetime) -> list:

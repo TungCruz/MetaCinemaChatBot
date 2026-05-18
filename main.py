@@ -3,10 +3,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime, timezone, timedelta
+import logging
 import os
 import time
 import threading
 from dotenv import load_dotenv
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 from db import get_movie_context, get_food_context, get_knowledge_context
 from gemini import call_gemini, build_system_prompt
@@ -55,6 +63,7 @@ class ChatRequest(BaseModel):
     message: str
     history: list[HistoryItem] = []
     user_id: Optional[int] = None
+    session_token: Optional[str] = None   # anonymous session key (UUID from frontend localStorage)
     role: Optional[str] = None
     page_context: Optional[dict] = None
 
@@ -83,10 +92,9 @@ def chat(req: ChatRequest, request: Request):
     page_context = req.page_context or {}
 
     # Inject per-user session (last_movie_id, last_movie_title) into page_context
-    if req.user_id:
-        sess = session_store.get(req.user_id)
-        if sess:
-            page_context = {**page_context, **sess}
+    sess = session_store.get(user_id=req.user_id, session_token=req.session_token)
+    if sess:
+        page_context = {**page_context, **sess}
 
     # Admin / Staff chatbot — runs before customer routing
     area = (page_context.get("area") or "").lower()
@@ -104,8 +112,9 @@ def chat(req: ChatRequest, request: Request):
     routed = try_build_routed_reply(message, page_context, req.user_id, now_vn)
     if routed is not None:
         # Persist session updates (e.g. last resolved movie)
-        if req.user_id and routed.get("session_update"):
-            session_store.update(req.user_id, routed["session_update"])
+        if routed.get("session_update") and (req.user_id or req.session_token):
+            session_store.update(user_id=req.user_id, session_token=req.session_token,
+                                 data=routed["session_update"])
         return ChatResponse(reply=routed["reply"], actions=routed.get("actions", []))
 
     # Fallback: Gemini AI
@@ -120,8 +129,8 @@ def chat(req: ChatRequest, request: Request):
 
     # Add context hint to Gemini if user was discussing a specific movie
     page_note = ""
-    if req.user_id:
-        last_title = session_store.get(req.user_id).get("last_movie_title", "")
+    if req.user_id or req.session_token:
+        last_title = session_store.get(user_id=req.user_id, session_token=req.session_token).get("last_movie_title", "")
         if last_title:
             page_note = f"User vừa hỏi về phim **{last_title}** — ưu tiên trả lời liên quan đến phim này nếu không có yêu cầu khác."
 

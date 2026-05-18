@@ -2,11 +2,14 @@
 Port of ChatController.cs TryBuildRoutedReply — customer-facing intents only.
 Admin/staff intents are still handled by C# (not ported yet).
 """
+import logging
 import re
 import unicodedata
 from datetime import datetime, timedelta
 from typing import Optional
 from db import get_conn
+
+logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -358,14 +361,18 @@ def _build_showtime_reply(message: str, page_context: dict, now: datetime) -> Op
         seen_titles: dict[int, str] = {}
         for r in rows:
             seen_titles.setdefault(r.MovieId, r.MovieTitle)
+        best_score, best_mid = 0, None
         for mid, title in seen_titles.items():
             nm_title = normalize(title)
-            # Full title match OR all significant words (6+ chars) present
-            sig_words = [w for w in nm_title.split() if len(w) >= 6]
-            if nm_title in nm or (sig_words and all(w in nm for w in sig_words)):
-                page_movie_id = mid
-                rows = [r for r in rows if r.MovieId == mid]
-                break
+            score = 100 if nm_title in nm else 0
+            tokens = [t for t in re.split(r"[^a-z0-9]+", nm_title) if len(t) >= 3]
+            score += sum(10 if len(t) >= 5 else 3 for t in tokens if t in nm)
+            if score > best_score:
+                best_score, best_mid = score, mid
+        # Threshold: full match (100), one long token (10), or two short tokens (6)
+        if best_score >= 6:
+            page_movie_id = best_mid
+            rows = [r for r in rows if r.MovieId == best_mid]
 
     date_label = requested_date.strftime("ngày %d/%m/%Y") if requested_date else "hiện tại"
 
@@ -657,7 +664,7 @@ def _build_payment_help_reply(user_id: Optional[int] = None) -> dict:
     """Hiển thị giao dịch 24h gần nhất của user (nếu đăng nhập) + hướng dẫn xử lý."""
     if user_id:
         sql = """
-            SELECT TOP 3 b.Id, b.PaymentStatus, b.GrandTotal, b.CreatedAt,
+            SELECT TOP 5 b.Id, b.PaymentStatus, b.GrandTotal, b.CreatedAt,
                    m.Title AS MovieTitle, s.StartTime
             FROM Bookings b
             INNER JOIN Showtimes s ON s.Id = b.ShowtimeId
@@ -666,14 +673,14 @@ def _build_payment_help_reply(user_id: Optional[int] = None) -> dict:
               AND b.CreatedAt >= ?
             ORDER BY b.CreatedAt DESC
         """
-        cutoff_utc = datetime.utcnow() - timedelta(hours=24)
+        cutoff_utc = datetime.utcnow() - timedelta(days=7)
         try:
             with get_conn() as conn:
                 cursor = conn.cursor()
                 cursor.execute(sql, user_id, cutoff_utc)
                 rows = cursor.fetchall()
             if rows:
-                lines = ["Giao dịch gần đây của bạn (24 giờ qua):"]
+                lines = ["Giao dịch gần đây của bạn (7 ngày qua):"]
                 actions = []
                 for r in rows:
                     label = _PAYMENT_STATUS_LABELS.get(r.PaymentStatus, r.PaymentStatus)
@@ -750,40 +757,50 @@ def try_build_routed_reply(message: str, page_context: dict, user_id: Optional[i
 
     # Seat availability (must check before showtime to avoid overlap)
     if is_seat_status_question(nm):
+        logger.info("intent=seat_status user=%s", user_id)
         return _build_seat_status_reply(message, now)
 
     # Booking guide takes priority over showtime when user asks "how to" buy tickets
     # (prevents "hướng dẫn đặt vé" from being captured by showtime detector first)
     if is_booking_guide_question(nm) and any(kw in nm for kw in _GUIDANCE_HINTS):
+        logger.info("intent=booking_guide user=%s", user_id)
         return _build_booking_guide_reply(page_context, now)
 
     # Showtime schedule
     showtime_reply = _build_showtime_reply(message, page_context, now)
     if showtime_reply is not None:
+        logger.info("intent=showtime user=%s", user_id)
         return showtime_reply
 
     # My tickets
     if is_my_tickets_question(nm):
+        logger.info("intent=my_tickets user=%s", user_id)
         return _build_my_tickets_reply(user_id)
 
     # Payment issues
     if is_payment_help_question(nm):
+        logger.info("intent=payment_help user=%s", user_id)
         return _build_payment_help_reply(user_id)
 
     # Policy / promotions / address
     if is_policy_question(nm):
+        logger.info("intent=policy user=%s", user_id)
         return _build_policy_reply(nm)
 
     # Movie info / list
     if is_movie_question(nm):
+        logger.info("intent=movie_info user=%s", user_id)
         return _build_movie_reply(now)
 
     # Food / menu
     if is_food_question(nm):
+        logger.info("intent=food user=%s", user_id)
         return _build_food_reply(nm)
 
     # Booking guide
     if is_booking_guide_question(nm):
+        logger.info("intent=booking_guide user=%s", user_id)
         return _build_booking_guide_reply(page_context, now)
 
+    logger.info("intent=gemini_fallback user=%s msg=%.60r", user_id, message)
     return None  # falls through to Gemini
