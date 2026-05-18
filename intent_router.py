@@ -175,11 +175,10 @@ def is_seat_status_question(nm: str) -> bool:
 
 
 def is_movie_question(nm: str) -> bool:
+    # Only match "list all movies" queries — specific questions about a movie go to Gemini
     return asks_global_movie_list(nm) or any(kw in nm for kw in [
         "noi dung phim", "the loai", "dien vien", "dao dien",
         "phim hay", "review phim", "gioi thieu phim", "noi ve gi", "ke ve",
-        "phu hop voi", "co hay khong", "nen xem", "danh gia phim",
-        "cho tre em", "cho gia dinh", "cho cap doi", "cho nguoi lon",
     ])
 
 
