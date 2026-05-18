@@ -106,6 +106,20 @@ _SYNONYM_GROUPS: list[tuple[list[str], str]] = [
       "chon vi tri"], "ghe"),
     (["ghe trong con", "ghe con", "con ghe nao",
       "con cho ngoi", "con bao nhieu ghe"], "cho trong"),
+
+    # ── Teen-code / Casual speech ─────────────────────────────────────────
+    # "coi phim" = muốn đi xem → tra lịch chiếu
+    (["coi phim", "muon coi", "di coi", "ra coi",
+      "coi not", "coi bom tan"], "lich chieu"),
+    # "coi gì" = xem phim gì đang chiếu
+    (["coi gi", "coi phim gi", "chieu gi vay",
+      "co gi coi", "tap phim gi"], "phim gi"),
+    # Đánh giá tích cực / hỏi review
+    (["phim xin", "phim dinh", "phim hot", "phim hay vl",
+      "nhieu nguoi khen", "phim trend", "phim noi tieng"], "review phim"),
+    # Phim sắp ra
+    (["sap ra chua", "bao gio ra rap", "khi nao ra rap",
+      "sap duoc chieu chua"], "sap chieu"),
 ]
 
 
@@ -125,6 +139,13 @@ def expand_synonyms(nm: str) -> str:
 _GUIDANCE_HINTS: list[str] = [
     "huong dan", "cach dat", "cach mua", "nhu the nao de",
     "lam sao", "buoc", "quy trinh", "tu dat ve", "tu mua ve",
+]
+
+# Pronoun references to a previously mentioned movie ("phim đó", "phim này"…)
+# Detected to inject last_movie_id from session into page_context
+_MOVIE_REF_WORDS: list[str] = [
+    "phim do", "phim nay", "phim kia", "phim ay",
+    "bo phim do", "phim vua noi", "cai phim do",
 ]
 
 
@@ -352,7 +373,12 @@ def _build_showtime_reply(message: str, page_context: dict, now: datetime) -> Op
         title = rows[0].MovieTitle
         times = "; ".join(_format_showtime_item(r) for r in rows)
         reply = f"Có. {date_label}, phim {title} có suất: {times}. Bạn có thể bấm nhanh một suất bên dưới để chọn ghế."
-        return {"reply": reply, "actions": _build_showtime_actions(rows)}
+        return {
+            "reply": reply,
+            "actions": _build_showtime_actions(rows),
+            # Store resolved movie so follow-up questions ("phim đó…") work
+            "session_update": {"last_movie_id": page_movie_id, "last_movie_title": title},
+        }
 
     from collections import defaultdict
     by_movie = defaultdict(list)
@@ -610,16 +636,66 @@ def _build_my_tickets_reply(user_id: Optional[int]) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 #  Payment help reply
 # ─────────────────────────────────────────────────────────────────────────────
-def _build_payment_help_reply() -> dict:
+_PAYMENT_GENERIC_REPLY = (
+    "Một số lý do thanh toán có thể gặp vấn đề:\n"
+    "1. QR code PayOS hết hạn (quá 15 phút) → đặt lại từ đầu.\n"
+    "2. Ghế đã được người khác đặt trong lúc bạn thanh toán → chọn ghế khác.\n"
+    "3. Đã bị trừ tiền nhưng chưa nhận vé → chờ 5-10 phút rồi kiểm tra mục 'Vé của tôi'."
+    " Nếu vẫn chưa có, gọi hotline 0799010072 kèm thông tin giao dịch."
+)
+
+_PAYMENT_STATUS_LABELS = {
+    "Paid":           "✅ Đã thanh toán",
+    "CheckedIn":      "✅ Đã check-in",
+    "PendingPayment": "⏳ Đang chờ thanh toán",
+    "PendingSelect":  "⏳ Chưa hoàn tất",
+    "Cancelled":      "❌ Đã huỷ",
+}
+
+
+def _build_payment_help_reply(user_id: Optional[int] = None) -> dict:
+    """Hiển thị giao dịch 24h gần nhất của user (nếu đăng nhập) + hướng dẫn xử lý."""
+    if user_id:
+        sql = """
+            SELECT TOP 3 b.Id, b.PaymentStatus, b.GrandTotal, b.CreatedAt,
+                   m.Title AS MovieTitle, s.StartTime
+            FROM Bookings b
+            INNER JOIN Showtimes s ON s.Id = b.ShowtimeId
+            INNER JOIN Movies    m ON m.Id = s.MovieId
+            WHERE b.UserId = ?
+              AND b.CreatedAt >= ?
+            ORDER BY b.CreatedAt DESC
+        """
+        cutoff_utc = datetime.utcnow() - timedelta(hours=24)
+        try:
+            with get_conn() as conn:
+                cursor = conn.cursor()
+                cursor.execute(sql, user_id, cutoff_utc)
+                rows = cursor.fetchall()
+            if rows:
+                lines = ["Giao dịch gần đây của bạn (24 giờ qua):"]
+                actions = []
+                for r in rows:
+                    label = _PAYMENT_STATUS_LABELS.get(r.PaymentStatus, r.PaymentStatus)
+                    lines.append(
+                        f"- {r.MovieTitle} | {r.StartTime.strftime('%d/%m %H:%M')}"
+                        f" | {_format_money(r.GrandTotal)} | {label}"
+                    )
+                    if r.PaymentStatus in ("Paid", "CheckedIn"):
+                        actions.append({"type": "open_url", "label": f"Xem vé #{r.Id}",
+                                        "url": f"/Booking/MyTicket/{r.Id}"})
+                lines += ["", _PAYMENT_GENERIC_REPLY]
+                return {
+                    "reply": "\n".join(lines),
+                    "actions": actions or [{"type": "open_url", "label": "Xem vé của tôi",
+                                            "url": "/Booking/MyTickets"}],
+                }
+        except Exception:
+            pass  # fall through to generic reply
+
     return {
-        "reply": (
-            "Một số lý do thanh toán có thể gặp vấn đề:\n"
-            "1. QR code PayOS hết hạn (quá 15 phút) → đặt lại từ đầu.\n"
-            "2. Ghế đã được người khác đặt trong lúc bạn thanh toán → chọn ghế khác.\n"
-            "3. Đã bị trừ tiền nhưng chưa nhận vé → chờ 5-10 phút rồi kiểm tra mục 'Vé của tôi'. "
-            "Nếu vẫn chưa có, gọi hotline 0799010072 kèm thông tin giao dịch."
-        ),
-        "actions": [{"type": "open_url", "label": "Xem vé của tôi", "url": "/Booking/MyTickets"}]
+        "reply": _PAYMENT_GENERIC_REPLY,
+        "actions": [{"type": "open_url", "label": "Xem vé của tôi", "url": "/Booking/MyTickets"}],
     }
 
 
@@ -666,6 +742,12 @@ def _build_booking_guide_reply(page_context: dict, now: datetime) -> dict:
 def try_build_routed_reply(message: str, page_context: dict, user_id: Optional[int], now: datetime) -> Optional[dict]:
     nm = expand_synonyms(normalize(message))
 
+    # Resolve pronoun references ("phim đó", "phim này"…) using session context
+    if any(kw in nm for kw in _MOVIE_REF_WORDS):
+        last_id = page_context.get("last_movie_id")
+        if last_id and not page_context.get("movieId"):
+            page_context = {**page_context, "movieId": last_id}
+
     # Seat availability (must check before showtime to avoid overlap)
     if is_seat_status_question(nm):
         return _build_seat_status_reply(message, now)
@@ -686,7 +768,7 @@ def try_build_routed_reply(message: str, page_context: dict, user_id: Optional[i
 
     # Payment issues
     if is_payment_help_question(nm):
-        return _build_payment_help_reply()
+        return _build_payment_help_reply(user_id)
 
     # Policy / promotions / address
     if is_policy_question(nm):

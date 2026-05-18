@@ -13,6 +13,7 @@ from gemini import call_gemini, build_system_prompt
 from intent_router import try_build_routed_reply
 from admin_router import try_build_admin_reply
 from staff_router import try_build_staff_reply
+import session_store
 
 load_dotenv()
 
@@ -81,6 +82,12 @@ def chat(req: ChatRequest, request: Request):
     now_vn = datetime.now(timezone(timedelta(hours=7))).replace(tzinfo=None)
     page_context = req.page_context or {}
 
+    # Inject per-user session (last_movie_id, last_movie_title) into page_context
+    if req.user_id:
+        sess = session_store.get(req.user_id)
+        if sess:
+            page_context = {**page_context, **sess}
+
     # Admin / Staff chatbot — runs before customer routing
     area = (page_context.get("area") or "").lower()
     mode = (page_context.get("mode") or "").lower()
@@ -96,6 +103,9 @@ def chat(req: ChatRequest, request: Request):
     # Fast-path: customer intent routing (no Gemini call)
     routed = try_build_routed_reply(message, page_context, req.user_id, now_vn)
     if routed is not None:
+        # Persist session updates (e.g. last resolved movie)
+        if req.user_id and routed.get("session_update"):
+            session_store.update(req.user_id, routed["session_update"])
         return ChatResponse(reply=routed["reply"], actions=routed.get("actions", []))
 
     # Fallback: Gemini AI
@@ -108,7 +118,14 @@ def chat(req: ChatRequest, request: Request):
     food_context      = _cached_ctx("food",      get_food_context,                  600)
     knowledge_context = _cached_ctx("knowledge", get_knowledge_context,             600)
 
-    system_prompt = build_system_prompt(movie_context, food_context, knowledge_context)
+    # Add context hint to Gemini if user was discussing a specific movie
+    page_note = ""
+    if req.user_id:
+        last_title = session_store.get(req.user_id).get("last_movie_title", "")
+        if last_title:
+            page_note = f"User vừa hỏi về phim **{last_title}** — ưu tiên trả lời liên quan đến phim này nếu không có yêu cầu khác."
+
+    system_prompt = build_system_prompt(movie_context, food_context, knowledge_context, page_note)
 
     reply = call_gemini(api_key, system_prompt, req.history[-_MAX_HISTORY:], message)
 
