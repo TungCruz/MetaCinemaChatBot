@@ -10,11 +10,69 @@ import re
 from datetime import datetime, timedelta
 from typing import Optional
 from db import get_conn
-from intent_router import normalize, extract_requested_date
+from intent_router import normalize, expand_synonyms, extract_requested_date
 from admin_router import (
     _build_report_range, _fmt_money, _vn_to_utc,
     _counter_sales, _payment, _food,
 )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Staff-specific synonym expansion
+#  Áp dụng sau expand_synonyms() chung — chỉ dùng trong context nhân viên.
+# ─────────────────────────────────────────────────────────────────────────────
+_STAFF_SYNONYM_GROUPS: list[tuple[list[str], str]] = [
+    # ── Tình trạng ghế ───────────────────────────────────────────────────
+    (["con cho ngoi", "ghe da ban", "ghe da dat",
+      "kiem tra ghe", "suc chua phong", "co bao nhieu ghe",
+      "phong con ghe", "ghe trong phong"], "ghe trong"),
+
+    # ── Lịch chiếu hôm nay ───────────────────────────────────────────────
+    (["lich phim", "phim hom nay", "suat hom nay",
+      "buoi chieu hom nay", "xem lich", "lich chieu hom nay",
+      "hom nay chieu gi", "chieu gi hom nay"], "lich hom nay"),
+
+    # ── Chấm công / ca làm ───────────────────────────────────────────────
+    (["nghi phep", "vang mat", "ngay cong",
+      "gio vao lam", "gio ra ve", "ca toi nay", "ca hom nay",
+      "ai truc ca", "truc ca", "gio lam hom nay"], "ca lam"),
+
+    # ── Bán tại quầy ─────────────────────────────────────────────────────
+    (["ve tai quay", "ban ve cho khach", "thanh toan tai quay",
+      "dat ve tai quay", "pos", "tiep khach",
+      "ban ve truc tiep", "thu tien khach"], "ban tai quay"),
+
+    # ── Phòng chiếu ──────────────────────────────────────────────────────
+    (["phong chieu", "tinh trang phong",
+      "phong bi loi", "phong nao dang chieu",
+      "kiem tra phong", "phong trong"], "phong"),
+
+    # ── Thanh toán / giao dịch lỗi ───────────────────────────────────────
+    (["hoa don", "bill", "lich su giao dich",
+      "giao dich bi loi", "loi thanh toan",
+      "ve chua thanh toan", "pending payment",
+      "khach chua thanh toan"], "giao dich"),
+
+    # ── Doanh thu ca (quản lý ca) ────────────────────────────────────────
+    (["ket qua kinh doanh", "tong tien thu", "cuoi ca",
+      "thu duoc bao nhieu", "so tien hom nay",
+      "bao nhieu tien", "doanh thu hom nay",
+      "ca nay thu duoc", "tong doanh thu"], "doanh thu"),
+
+    # ── Thống kê nhân viên (quản lý ca) ─────────────────────────────────
+    (["ai lam hom nay", "danh sach nhan vien hom nay",
+      "nhan vien truc", "ai truc", "lich nhan vien",
+      "so nhan vien", "bao nhieu nhan vien hom nay"], "nhan vien hom nay"),
+]
+
+
+def _expand_staff(nm: str) -> str:
+    """Thêm canonical keywords staff-specific vào nm."""
+    extras: list[str] = []
+    for variants, canonical in _STAFF_SYNONYM_GROUPS:
+        if canonical not in nm and any(v in nm for v in variants):
+            extras.append(canonical)
+    return nm + (" " + " ".join(extras) if extras else "")
 
 
 def _staff_action(label: str, action: str) -> dict:
@@ -346,10 +404,11 @@ def _staff_attendance(role: Optional[str], now: datetime) -> dict:
             lines.append("Chưa có nhân viên nào check-in hôm nay.")
         else:
             for r in rows[:10]:
-                checkout = r.CheckOut.strftime("%H:%M") if r.CheckOut else "—"
+                checkin_vn  = r.CheckIn  + timedelta(hours=7)
+                checkout_vn = (r.CheckOut + timedelta(hours=7)).strftime("%H:%M") if r.CheckOut else "—"
                 hrs = f"{float(r.hours or 0):.1f}h"
                 lines.append(
-                    f"- {r.StaffName} ({r.Role}): vào {r.CheckIn.strftime('%H:%M')} — ra {checkout} | {hrs} | {_fmt_money(float(r.amount or 0))}"
+                    f"- {r.StaffName} ({r.Role}): vào {checkin_vn.strftime('%H:%M')} — ra {checkout_vn} | {hrs} | {_fmt_money(float(r.amount or 0))}"
                 )
             if len(rows) > 10:
                 lines.append(f"Còn {len(rows) - 10} nhân viên khác.")
@@ -375,7 +434,7 @@ def _staff_stats(now: datetime) -> dict:
     sql_checkin_today = """
         SELECT COUNT(DISTINCT a.StaffId) AS cnt
         FROM Attendance a
-        WHERE CAST(a.CheckIn AS DATE) = CAST(? AS DATE)
+        WHERE a.CheckIn >= ? AND a.CheckIn < ?
     """
 
     try:
@@ -388,7 +447,9 @@ def _staff_stats(now: datetime) -> dict:
             c.execute(sql_by_role)
             roles = c.fetchall()
 
-            c.execute(sql_checkin_today, now.date())
+            today_utc_s = _vn_to_utc(datetime.combine(now.date(), datetime.min.time()))
+            today_utc_e = today_utc_s + timedelta(days=1)
+            c.execute(sql_checkin_today, today_utc_s, today_utc_e)
             checkin_today = int(c.fetchone().cnt or 0)
 
         lines = [f"Thống kê nhân viên ({now.strftime('%d/%m/%Y')}):"]
@@ -441,7 +502,7 @@ def try_build_staff_reply(message: str, role: Optional[str], now: datetime) -> O
         }
 
     is_manager = _is_shiftmanager(role)
-    nm = normalize(message)
+    nm = _expand_staff(expand_synonyms(normalize(message)))
 
     # ── Thống kê nhân viên (chỉ quản lý ca) ─────────────────────────────────
     if _is_staff_stats_q(nm):

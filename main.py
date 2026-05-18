@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime, timezone, timedelta
 import os
+import time
 from dotenv import load_dotenv
 
 from db import get_movie_context, get_food_context, get_knowledge_context
@@ -15,6 +16,17 @@ from staff_router import try_build_staff_reply
 load_dotenv()
 
 _INTERNAL_SECRET = os.getenv("CHATBOT_INTERNAL_SECRET", "")
+
+# ── Simple TTL cache for Gemini context (avoid 3 DB hits per fallback message) ──
+_ctx_cache: dict[str, tuple[float, str]] = {}
+
+def _cached_ctx(key: str, fn, ttl: int) -> str:
+    ts, val = _ctx_cache.get(key, (0.0, ""))
+    if time.monotonic() - ts < ttl:
+        return val
+    val = fn()
+    _ctx_cache[key] = (time.monotonic(), val)
+    return val
 
 app = FastAPI(title="MetaCinema Chatbot Service", version="1.0.0")
 
@@ -84,11 +96,15 @@ def chat(req: ChatRequest, request: Request):
     if not api_key:
         return ChatResponse(reply="Chatbot chưa được cấu hình. Vui lòng liên hệ quản trị viên.")
 
-    movie_context     = get_movie_context()
-    food_context      = get_food_context()
-    knowledge_context = get_knowledge_context()
+    # Movie context: TTL 2 min (has live countdowns); food/knowledge: TTL 10 min
+    movie_context     = _cached_ctx("movie",     lambda: get_movie_context(now_vn), 120)
+    food_context      = _cached_ctx("food",      get_food_context,                  600)
+    knowledge_context = _cached_ctx("knowledge", get_knowledge_context,             600)
 
     system_prompt = build_system_prompt(movie_context, food_context, knowledge_context)
-    reply = call_gemini(api_key, system_prompt, req.history, message)
+
+    # Limit history to last 20 messages (10 turns) to avoid Gemini token overflow
+    trimmed_history = req.history[-20:] if len(req.history) > 20 else req.history
+    reply = call_gemini(api_key, system_prompt, trimmed_history, message)
 
     return ChatResponse(reply=reply)

@@ -22,6 +22,106 @@ def normalize(text: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Synonym expansion — maps nhiều cách nói khác nhau → keyword chuẩn
+#  Tất cả string đã ở dạng normalize() (không dấu, lowercase, single space).
+#  Mỗi tuple: ([variants], canonical_keyword_đã_có_trong_intent_detectors)
+# ─────────────────────────────────────────────────────────────────────────────
+_SYNONYM_GROUPS: list[tuple[list[str], str]] = [
+    # ── Lịch chiếu / đặt vé ───────────────────────────────────────────────
+    (["ra rap", "den rap", "di rap", "muon di xem phim",
+      "muon dat ve", "book ve", "dat cho", "mua cho",
+      "buoi chieu", "phim chieu luc", "co suat nao", "bao gio chieu",
+      "khi nao chieu", "chieu o dau"], "lich chieu"),
+
+    # ── Danh sách phim đang chiếu ─────────────────────────────────────────
+    (["xem gi", "xem phim gi", "co gi xem", "co gi hay",
+      "hom nay co gi", "co gi chieu", "phim nao co",
+      "dang co phim gi", "phim tuan nay", "cuoi tuan co gi",
+      "phim gi co", "co phim gi khong"], "phim gi"),
+
+    # ── Nội dung / thông tin phim ─────────────────────────────────────────
+    (["cot truyen", "tom tat phim", "tom tat noi dung",
+      "noi dung chinh", "kich ban", "nhan vat chinh",
+      "ke ve cai gi", "phim ke ve"], "noi dung phim"),
+    (["co hay khong", "hay khong", "nen xem khong",
+      "dang xem khong", "co dang xem khong", "tot khong",
+      "nhu the nao", "the nao", "cam nhan", "danh gia",
+      "rating", "diem so", "diem imdb"], "review phim"),
+
+    # ── Đồ ăn / thức uống ────────────────────────────────────────────────
+    (["bong ngo"], "bap"),                               # bỏng ngô = bắp
+    (["thuc an", "an gi", "do co san", "do an nhe",
+      "mon an"], "do an"),
+    (["thuc uong", "nuoc ngot", "coca cola", "coca",
+      "giai khat", "pepsi"], "nuoc"),
+    (["keo", "nachos", "chip", "banh vat"], "snack"),
+
+    # ── Chính sách / quy định ────────────────────────────────────────────
+    (["tra lai tien", "tra lai", "refund",
+      "hoan lai tien", "hoan lai"], "hoan tien"),
+    (["huy bo", "huy dat", "huy lich", "khong di xem nua",
+      "muon huy"], "huy ve"),
+    (["noi quy", "quy che", "quy tac",
+      "the le", "dieu kien vao rap"], "quy dinh"),
+    (["mang tu ngoai", "mang vao", "dem vao rap",
+      "tu ngoai vao", "mang theo do an"], "mang do an"),
+    (["so dien thoai", "so phone", "lien he",
+      "lien lac", "goi dien", "contact", "cham soc khach hang",
+      "cskh", "support"], "hotline"),
+    (["o dau", "o cho nao", "duong nao", "vi tri rap",
+      "gap o dau", "rap o dau", "tim rap", "ban do",
+      "chi nhanh"], "dia chi"),
+    (["sale", "voucher", "ma giam", "giam gia",
+      "discount", "ma uu dai", "ma khuyen mai"], "khuyen mai"),
+    (["bao nhieu tuoi", "may tuoi", "gioi han tuoi",
+      "tuoi toi thieu", "tre em", "kiem tra tuoi"], "do tuoi"),
+
+    # ── Vé của tôi ───────────────────────────────────────────────────────
+    (["xem ve", "kiem tra ve", "check ve", "ve cua minh",
+      "ve toi dat", "lich su dat", "lich su mua",
+      "lich su booking", "don hang cua toi",
+      "ve da mua", "booking cua toi", "tim ve"], "ve cua toi"),
+
+    # ── Vấn đề thanh toán ────────────────────────────────────────────────
+    (["mat tien", "bi mat tien", "chuyen tien roi",
+      "da chuyen khoan roi", "tra tien roi",
+      "tru mat tien roi"], "bi tru tien"),
+    (["sao khong co ve", "sao chua co ve",
+      "chua nhan duoc ve", "ve dau roi",
+      "tim khong thay ve", "khong thay ve dau"], "chua nhan ve"),
+    (["tra tien", "momo", "zalopay",
+      "ngan hang", "internet banking"], "chuyen khoan"),
+
+    # ── Hướng dẫn đặt vé ─────────────────────────────────────────────────
+    (["huong dan dat ve", "cach dat ve", "dat ve nhu the nao",
+      "mua ve nhu the nao", "quy trinh dat ve",
+      "buoc dat ve", "lam the nao de dat ve",
+      "huong dan mua ve", "tu dat ve"], "dat ve"),
+
+    # ── Ghế / chỗ ngồi ───────────────────────────────────────────────────
+    (["vi tri ngoi", "cho ngoi", "vi tri ghe",
+      "chon vi tri"], "ghe"),
+    (["ghe trong con", "ghe con", "con ghe nao",
+      "con cho ngoi", "con bao nhieu ghe"], "cho trong"),
+]
+
+
+def expand_synonyms(nm: str) -> str:
+    """Thêm canonical keywords vào cuối nm cho bất kỳ synonym nào được nhận ra.
+
+    Chỉ append canonical nếu chưa có trong nm, tránh trùng lặp.
+    Dùng sau normalize() — nm đã ở dạng chuẩn (không dấu, lowercase).
+    """
+    extras: list[str] = []
+    for variants, canonical in _SYNONYM_GROUPS:
+        if canonical not in nm and any(v in nm for v in variants):
+            extras.append(canonical)
+    if not extras:
+        return nm
+    return nm + " " + " ".join(extras)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Intent detectors — port of Is*Question() methods
 # ─────────────────────────────────────────────────────────────────────────────
 def asks_global_movie_list(nm: str) -> bool:
@@ -179,7 +279,7 @@ def _build_showtime_actions(rows: list) -> list:
 #  Showtime reply
 # ─────────────────────────────────────────────────────────────────────────────
 def _build_showtime_reply(message: str, page_context: dict, now: datetime) -> Optional[dict]:
-    nm = normalize(message)
+    nm = expand_synonyms(normalize(message))
     requested_date = extract_requested_date(message, now)
     page_movie_id = page_context.get("movieId") if page_context else None
 
@@ -224,6 +324,20 @@ def _build_showtime_reply(message: str, page_context: dict, now: datetime) -> Op
 
     if not rows:
         return {"reply": "Không tìm thấy suất chiếu phù hợp. Bạn thử hỏi ngày khác hoặc gọi 0799010072 nhé.", "actions": []}
+
+    # Detect movie name mentioned in message (when not already on a movie page)
+    if not page_movie_id and not global_list:
+        seen_titles: dict[int, str] = {}
+        for r in rows:
+            seen_titles.setdefault(r.MovieId, r.MovieTitle)
+        for mid, title in seen_titles.items():
+            nm_title = normalize(title)
+            # Full title match OR all significant words (6+ chars) present
+            sig_words = [w for w in nm_title.split() if len(w) >= 6]
+            if nm_title in nm or (sig_words and all(w in nm for w in sig_words)):
+                page_movie_id = mid
+                rows = [r for r in rows if r.MovieId == mid]
+                break
 
     date_label = requested_date.strftime("ngày %d/%m/%Y") if requested_date else "hiện tại"
 
@@ -543,11 +657,18 @@ def _build_booking_guide_reply(page_context: dict, now: datetime) -> dict:
 #  Main entry point — called from main.py before Gemini fallback
 # ─────────────────────────────────────────────────────────────────────────────
 def try_build_routed_reply(message: str, page_context: dict, user_id: Optional[int], now: datetime) -> Optional[dict]:
-    nm = normalize(message)
+    nm = expand_synonyms(normalize(message))
 
     # Seat availability (must check before showtime to avoid overlap)
     if is_seat_status_question(nm):
         return _build_seat_status_reply(message, now)
+
+    # Booking guide takes priority over showtime for explicit "how-to" questions
+    # (prevents "hướng dẫn đặt vé" from being captured by showtime detector)
+    _GUIDANCE_HINTS = ["huong dan", "cach dat", "cach mua", "nhu the nao de", "lam sao",
+                       "buoc", "quy trinh", "tu dat ve", "tu mua ve"]
+    if is_booking_guide_question(nm) and any(kw in nm for kw in _GUIDANCE_HINTS):
+        return _build_booking_guide_reply(page_context, now)
 
     # Showtime schedule
     showtime_reply = _build_showtime_reply(message, page_context, now)

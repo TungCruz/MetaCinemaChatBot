@@ -133,8 +133,10 @@ def get_conn():
 # ─────────────────────────────────────────────────────────────────────────────
 #  Movie context — port of BuildMovieContext(DateTime nowVn)
 # ─────────────────────────────────────────────────────────────────────────────
-def get_movie_context() -> str:
-    now      = datetime.now()
+def get_movie_context(now: datetime = None) -> str:
+    if now is None:
+        from datetime import timezone, timedelta as _td
+        now = datetime.now(timezone(_td(hours=7))).replace(tzinfo=None)
     today    = now.date()
     tomorrow = today + timedelta(days=1)
     cutoff   = today + timedelta(days=8)
@@ -165,10 +167,10 @@ def get_movie_context() -> str:
         SELECT TOP 5
             m.Title, m.Genre, m.ReleaseDate, m.Description
         FROM Movies m
-        WHERE m.ReleaseDate > GETDATE()
+        WHERE m.ReleaseDate > ?
           AND NOT EXISTS (
               SELECT 1 FROM Showtimes s
-              WHERE s.MovieId = m.Id AND s.StartTime >= GETDATE()
+              WHERE s.MovieId = m.Id AND s.StartTime >= ?
           )
         ORDER BY m.ReleaseDate
     """
@@ -261,7 +263,7 @@ def get_movie_context() -> str:
                         lines.append(f"- Nội dung: {m.Description}")
 
             # ── Phim sắp chiếu ─────────────────────────────────────────────
-            cursor.execute(sql_coming_soon)
+            cursor.execute(sql_coming_soon, now, now)
             coming = cursor.fetchall()
             if coming:
                 lines.append("")

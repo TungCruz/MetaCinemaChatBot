@@ -6,7 +6,86 @@ import re
 from datetime import datetime, timedelta, date as date_type, time as dt_time
 from typing import Optional
 from db import get_conn
-from intent_router import normalize, extract_requested_date
+from intent_router import normalize, expand_synonyms, extract_requested_date
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Admin-specific synonym expansion
+#  Bổ sung sau expand_synonyms() chung — chỉ áp dụng trong context admin.
+#  Tất cả string ở dạng normalize() (không dấu, lowercase, single space).
+# ─────────────────────────────────────────────────────────────────────────────
+_ADMIN_SYNONYM_GROUPS: list[tuple[list[str], str]] = [
+    # ── Suất chiếu ───────────────────────────────────────────────────────
+    (["xem lich", "lich phim", "phim hom nay", "buoi hom nay",
+      "suat hom nay", "suat ngay", "lich tuan nay"], "lich chieu"),
+    # Verb tạo lịch (trigger _is_create_showtime_q)
+    (["lap lich", "xep lich", "len lich", "bo sung suat",
+      "tao moi suat", "lap suat", "tao lich chieu"], "tao"),
+    # Verb xóa (trigger _is_delete_showtime_q)
+    (["huy suat", "xoa suat", "loai bo suat", "bo suat",
+      "xoa lich", "huy lich chieu", "xoa het suat"], "xoa"),
+
+    # ── Thanh toán / giao dịch ───────────────────────────────────────────
+    (["hoa don", "bill", "receipt", "thu tien",
+      "lich su giao dich", "lich su thanh toan",
+      "chuyen khoan den", "tien vao", "tra tien roi"], "giao dich"),
+
+    # ── Doanh thu / báo cáo ──────────────────────────────────────────────
+    (["ket qua kinh doanh", "loi nhuan", "tong tien thu",
+      "so tien thu duoc", "cuoi ngay thu duoc",
+      "doanh thu hom nay", "thu duoc bao nhieu",
+      "ban duoc bao nhieu tien", "hieu qua kinh doanh"], "doanh thu"),
+    (["bao cao tong hop", "thong ke tong", "bao cao ngay",
+      "bao cao tuan", "bao cao thang", "xuat bao cao"], "bao cao"),
+
+    # ── Phim ─────────────────────────────────────────────────────────────
+    (["danh sach phim", "quan ly phim", "phim moi nhat",
+      "them phim", "cap nhat phim", "phim sap ra",
+      "bo sung phim", "chỉnh phim"], "sap chieu"),
+
+    # ── Phòng chiếu ──────────────────────────────────────────────────────
+    (["phong chieu", "rap chieu", "tinh trang phong",
+      "phong bi loi", "kiem tra phong", "sua chua phong",
+      "phong dang dung", "so phong", "capacity"], "phong"),
+
+    # ── Nhân viên / phân quyền ───────────────────────────────────────────
+    (["quan ly nhan vien", "quan ly nhan su", "danh sach staff",
+      "phan quyen", "cap quyen", "thay doi chuc vu",
+      "nhan luc", "tuyen dung", "bo phan", "cap nhat quyen"], "nhan vien"),
+
+    # ── Khách hàng / tài khoản ───────────────────────────────────────────
+    (["thanh vien", "dang ky", "member",
+      "profile khach", "tai khoan khach", "danh sach khach",
+      "khach moi", "nguoi mua"], "khach hang"),
+
+    # ── Chatbot knowledge ────────────────────────────────────────────────
+    (["day bot", "noi dung bot", "cap nhat kien thuc",
+      "sua chatbot", "them cau hoi", "them cau tra loi",
+      "bot biet gi", "chatbot tra loi gi", "faq"], "kien thuc"),
+
+    # ── Chấm công / ca làm ───────────────────────────────────────────────
+    (["nghi phep", "vang mat", "di muon", "ngay cong",
+      "gio vao", "gio ra", "cong lam", "tinh luong",
+      "quy dinh ca"], "cham cong"),
+
+    # ── Bán tại quầy ─────────────────────────────────────────────────────
+    (["ve tai quay", "ban ve cho khach", "thanh toan quay",
+      "pos", "quay vet", "thu ngan quay",
+      "dat ve cho khach", "ban truc tiep"], "ban tai quay"),
+
+    # ── Dữ liệu / kiến trúc hệ thống ────────────────────────────────────
+    (["erd", "schema", "mo hinh du lieu", "cau truc he thong",
+      "diagram", "entity", "bang du lieu", "thiet ke db"], "database"),
+]
+
+
+def _expand_admin(nm: str) -> str:
+    """Thêm canonical keywords admin-specific vào nm."""
+    extras: list[str] = []
+    for variants, canonical in _ADMIN_SYNONYM_GROUPS:
+        if canonical not in nm and any(v in nm for v in variants):
+            extras.append(canonical)
+    return nm + (" " + " ".join(extras) if extras else "")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1565,7 +1644,7 @@ def try_build_admin_reply(message: str, role: Optional[str], now: datetime, user
             "actions": [{"type": "open_url", "label": "Đăng nhập Admin", "url": "/User/Login"}]
         }
 
-    nm = normalize(message)
+    nm = _expand_admin(expand_synonyms(normalize(message)))
     pending = _get_pending_plan(user_id)
     has_plan = pending is not None
 
