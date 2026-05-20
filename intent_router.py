@@ -160,6 +160,17 @@ _RECOMMEND_WORDS: list[str] = [
     "cho tre em", "danh cho", "de xem", "xem cung", "nhat cho",
 ]
 
+_MOVIE_TITLE_STOP_WORDS = {
+    "phim", "dien", "anh", "tham", "lung", "danh", "cua",
+    "nhung", "mot", "voi", "cho", "the", "and", "movie",
+}
+
+_AGE_QUESTION_WORDS = [
+    "tuoi", "do tuoi", "c18", "c16", "c13", "phu hop",
+    "tre em", "hoc sinh", "duoi 18", "duoi 16", "duoi 13",
+    "bao nhieu tuoi", "may tuoi", "gioi han tuoi", "danh cho",
+]
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Intent detectors — port of Is*Question() methods
@@ -203,6 +214,10 @@ def is_policy_question(nm: str) -> bool:
         "chinh sach", "quy dinh", "hoan tien", "huy ve", "doi suat", "doi ve",
         "c18", "c16", "do tuoi", "mang do an", "khuyen mai", "uu dai", "hotline", "dia chi"
     ])
+
+
+def is_movie_age_question(nm: str) -> bool:
+    return any(kw in nm for kw in _AGE_QUESTION_WORDS)
 
 
 def is_my_tickets_question(nm: str) -> bool:
@@ -317,6 +332,151 @@ def _build_showtime_actions(rows: list) -> list:
             "price": float(row.BasePrice or 0),
         })
     return actions[:6]
+
+
+def _resolve_requested_movie(nm: str):
+    if not nm:
+        return None
+
+    try:
+        with get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT Id, Title, Genre, DurationMinutes, Rating, Description
+                FROM Movies
+                """
+            )
+            movies = cursor.fetchall()
+    except Exception:
+        return None
+
+    best_score, best_movie = 0, None
+    for movie in movies:
+        title = normalize(movie.Title or "")
+        if not title:
+            continue
+
+        score = 100 if title in nm else 0
+        tokens = [
+            t for t in re.split(r"[^a-z0-9]+", title)
+            if len(t) >= 3 and t not in _MOVIE_TITLE_STOP_WORDS
+        ]
+        for token in set(tokens):
+            if token in nm:
+                score += 3 if len(token) >= 5 else 1
+
+        if score > best_score:
+            best_score, best_movie = score, movie
+
+    return best_movie if best_score >= 3 else None
+
+
+def _get_movie(movie_id: int):
+    try:
+        with get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT Id, Title, Genre, DurationMinutes, Rating, Description
+                FROM Movies
+                WHERE Id = ?
+                """,
+                int(movie_id),
+            )
+            return cursor.fetchone()
+    except Exception:
+        return None
+
+
+def _rating_min_age(rating: str) -> Optional[int]:
+    if not rating:
+        return None
+    nm = normalize(str(rating)).upper()
+    match = re.search(r"(\d{1,2})", nm)
+    if match:
+        return int(match.group(1))
+    if nm.startswith(("P", "G")):
+        return 0
+    if nm.startswith("K"):
+        return 13
+    return None
+
+
+def _build_age_verdict(rating: str) -> str:
+    min_age = _rating_min_age(rating)
+    label = rating or "chưa cập nhật"
+    if min_age is None:
+        return f"Phân loại hiện tại là {label}, nhưng mình chưa xác định được mốc tuổi cụ thể từ dữ liệu này."
+    if min_age >= 18:
+        return f"Phim phân loại {label}, chỉ dành cho khán giả từ {min_age} tuổi trở lên, nên không phù hợp cho người dưới 18 tuổi."
+    if min_age > 0:
+        return f"Phim phân loại {label}, khán giả từ {min_age} tuổi trở lên có thể xem; người dưới {min_age} tuổi thì không phù hợp."
+    return f"Phim phân loại {label}, không có giới hạn tuổi theo dữ liệu rạp đang lưu."
+
+
+def _next_showtimes_for_movie(movie_id: int, now: datetime, limit: int = 3) -> list:
+    try:
+        with get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT TOP 3 s.Id AS ShowtimeId, s.StartTime, s.BasePrice, s.MovieId,
+                       r.Name AS RoomName, m.Title AS MovieTitle
+                FROM Showtimes s
+                INNER JOIN Movies m ON m.Id = s.MovieId
+                LEFT  JOIN Rooms  r ON r.Id = s.RoomId
+                WHERE s.MovieId = ? AND s.StartTime >= ?
+                ORDER BY s.StartTime
+                """,
+                int(movie_id),
+                now,
+            )
+            return cursor.fetchall()[:limit]
+    except Exception:
+        return []
+
+
+def _build_movie_age_reply(message: str, page_context: dict, now: datetime) -> Optional[dict]:
+    nm = expand_synonyms(normalize(message))
+    if not is_movie_age_question(nm):
+        return None
+
+    movie = None
+    page_movie_id = page_context.get("movieId") if page_context else None
+    if page_movie_id and not asks_global_movie_list(nm):
+        movie = _get_movie(int(page_movie_id))
+    if movie is None:
+        movie = _resolve_requested_movie(nm)
+    if movie is None:
+        return None
+
+    next_showtimes = _next_showtimes_for_movie(movie.Id, now)
+    lines = [
+        f"{movie.Title}",
+        f"- Phân loại: {movie.Rating or 'Chưa cập nhật'}",
+        f"- {_build_age_verdict(movie.Rating or '')}",
+    ]
+    if movie.Genre or movie.DurationMinutes:
+        lines.append(f"- Thể loại: {movie.Genre or 'Chưa cập nhật'} | Thời lượng: {movie.DurationMinutes or 'Chưa cập nhật'} phút")
+    if next_showtimes:
+        lines.append("- Suất gần nhất: " + "; ".join(
+            f"{s.StartTime.strftime('%d/%m %H:%M')} ({_format_room(s.RoomName)})"
+            for s in next_showtimes
+        ))
+
+    actions = [{
+        "type": "view_movie",
+        "label": "Xem chi tiết phim",
+        "url": f"/Movies/Details/{movie.Id}",
+        "movieId": movie.Id,
+    }]
+    actions.extend(_build_showtime_actions(next_showtimes))
+    return {
+        "reply": "\n".join(lines),
+        "actions": actions,
+        "session_update": {"last_movie_id": movie.Id, "last_movie_title": movie.Title},
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -786,6 +946,11 @@ def try_build_routed_reply(message: str, page_context: dict, user_id: Optional[i
     if is_seat_status_question(nm):
         logger.info("intent=seat_status user=%s", user_id)
         return _build_seat_status_reply(message, now)
+
+    movie_age_reply = _build_movie_age_reply(message, page_context, now)
+    if movie_age_reply is not None:
+        logger.info("intent=movie_age user=%s", user_id)
+        return movie_age_reply
 
     # Booking guide takes priority over showtime when user asks "how to" buy tickets
     # (prevents "hướng dẫn đặt vé" from being captured by showtime detector first)
