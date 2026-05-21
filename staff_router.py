@@ -7,7 +7,10 @@ Role-based access:
   Quản lý ca / Admin → all above + revenue report, staff stats, attendance
 """
 import re
+import json
+import os
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Optional
 from db import get_conn
 from intent_router import normalize, expand_synonyms, _apply_synonyms, extract_requested_date
@@ -78,6 +81,13 @@ def _expand_staff(nm: str) -> str:
 
 def _staff_action(label: str, action: str) -> dict:
     return {"type": "open_url", "label": label, "url": f"/Staff/Staff/{action}"}
+
+
+def _friendly_db_error(area: str) -> str:
+    return (
+        f"Mình chưa đọc được dữ liệu {area} lúc này. "
+        "Bạn vẫn có thể mở màn hình nghiệp vụ để thao tác trực tiếp."
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -167,6 +177,113 @@ def _is_staff_stats_q(nm: str) -> bool:
     ])
 
 
+def _table_exists(cursor, table_name: str) -> bool:
+    cursor.execute("SELECT CASE WHEN OBJECT_ID(?, 'U') IS NULL THEN 0 ELSE 1 END", f"dbo.{table_name}")
+    row = cursor.fetchone()
+    return bool(row and int(row[0] or 0) == 1)
+
+
+def _parse_attendance_datetime(value) -> Optional[datetime]:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        ms = re.search(r"/Date\((-?\d+)", value)
+        if ms:
+            try:
+                return datetime.utcfromtimestamp(int(ms.group(1)) / 1000)
+            except Exception:
+                return None
+        text = value.strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone().replace(tzinfo=None)
+            return parsed
+        except Exception:
+            return None
+    return None
+
+
+def _attendance_file_candidates() -> list[Path]:
+    here = Path(__file__).resolve()
+    env_path = os.getenv("ATTENDANCE_JSON_PATH", "").strip()
+    candidates = []
+    if env_path:
+        candidates.append(Path(env_path))
+    candidates.extend([
+        here.parents[1] / "MetaCinemaWeb" / "RapChieuPhim" / "App_Data" / "attendance.json",
+        here.parents[1] / "MetaCinemaWeb" / "RapChieuPhim" / "bin" / "App_Data" / "attendance.json",
+    ])
+    return candidates
+
+
+def _load_attendance_json_records() -> Optional[list[dict]]:
+    for path in _attendance_file_candidates():
+        try:
+            if not path.exists():
+                continue
+            raw = path.read_text(encoding="utf-8-sig")
+            data = json.loads(raw or "[]")
+            return data if isinstance(data, list) else []
+        except Exception:
+            continue
+    return None
+
+
+def _attendance_from_json(message: str, nm: str, now: datetime, action_url: str = "Attendance") -> Optional[dict]:
+    records = _load_attendance_json_records()
+    if records is None:
+        return None
+
+    rng = _build_report_range(message, nm, now, "week")
+    start_utc = rng["start_utc"]
+    end_utc = rng["end_utc"]
+    filtered = []
+    for item in records:
+        check_in = _parse_attendance_datetime(item.get("CheckIn") or item.get("checkIn"))
+        if not check_in or check_in < start_utc or check_in >= end_utc:
+            continue
+        role = item.get("Role") or item.get("role") or ""
+        if normalize(role) == "admin":
+            continue
+        filtered.append((item, check_in))
+
+    total_hours = sum(float((item.get("Hours") or item.get("hours") or 0) or 0) for item, _ in filtered)
+    total_amount = sum(float((item.get("Amount") or item.get("amount") or 0) or 0) for item, _ in filtered)
+    staff_ids = {item.get("StaffId") or item.get("staffId") for item, _ in filtered}
+    open_shifts = sum(1 for item, _ in filtered if not (item.get("CheckOut") or item.get("checkOut")))
+
+    lines = [
+        f"Tổng hợp chấm công {rng['label'].lower()}:",
+        f"- {len(filtered)} lượt chấm công, {len([x for x in staff_ids if x])} nhân viên, {open_shifts} ca đang mở.",
+        f"- Tổng giờ: {total_hours:.2f}h; tiền công tạm tính: {_fmt_money(total_amount)}.",
+    ]
+
+    from collections import defaultdict
+    by_staff = defaultdict(lambda: {"hours": 0.0, "amount": 0.0, "open": 0, "name": ""})
+    for item, _ in filtered:
+        key = item.get("StaffId") or item.get("staffId") or item.get("StaffName") or item.get("staffName") or "unknown"
+        bucket = by_staff[key]
+        bucket["name"] = item.get("StaffName") or item.get("staffName") or "Nhân viên"
+        bucket["hours"] += float((item.get("Hours") or item.get("hours") or 0) or 0)
+        bucket["amount"] += float((item.get("Amount") or item.get("amount") or 0) or 0)
+        if not (item.get("CheckOut") or item.get("checkOut")):
+            bucket["open"] += 1
+
+    top_staff = sorted(by_staff.values(), key=lambda x: x["hours"], reverse=True)[:5]
+    if top_staff:
+        lines.append("Theo nhân viên:")
+        for item in top_staff:
+            extra = f", {item['open']} ca đang mở" if item["open"] else ""
+            lines.append(f"- {item['name']}: {item['hours']:.2f}h, {_fmt_money(item['amount'])}{extra}.")
+
+    return {"reply": "\n".join(lines), "actions": [_staff_action("Chấm công", action_url)]}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Dashboard — cơ bản (nhân viên bán vé): không có doanh thu
 # ─────────────────────────────────────────────────────────────────────────────
@@ -205,7 +322,7 @@ def _staff_dashboard_basic(now: datetime) -> dict:
         ]
         return {"reply": "\n".join(lines), "actions": actions}
     except Exception as e:
-        return {"reply": f"Lỗi tải dashboard: {e}", "actions": [_staff_action("Trang nhân viên", "Index")]}
+        return {"reply": _friendly_db_error("dashboard nhân viên"), "actions": [_staff_action("Trang nhân viên", "Index")]}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -284,7 +401,7 @@ def _staff_dashboard_full(now: datetime) -> dict:
         ]
         return {"reply": "\n".join(lines), "actions": actions}
     except Exception as e:
-        return {"reply": f"Lỗi tải dashboard: {e}", "actions": [_staff_action("Trang nhân viên", "Index")]}
+        return {"reply": _friendly_db_error("dashboard nhân viên"), "actions": [_staff_action("Trang nhân viên", "Index")]}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -319,7 +436,7 @@ def _staff_room(now: datetime) -> dict:
 
         return {"reply": "\n".join(lines), "actions": [_staff_action("Quản lý phòng", "RoomStatus")]}
     except Exception as e:
-        return {"reply": f"Lỗi tải phòng: {e}", "actions": [_staff_action("Phòng chiếu", "RoomStatus")]}
+        return {"reply": _friendly_db_error("phòng chiếu"), "actions": [_staff_action("Phòng chiếu", "RoomStatus")]}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -364,16 +481,16 @@ def _staff_showtime(message: str, now: datetime) -> dict:
 
         return {"reply": "\n".join(lines), "actions": [_staff_action("Xác thực vé", "Index")]}
     except Exception as e:
-        return {"reply": f"Lỗi tải suất chiếu: {e}", "actions": []}
+        return {"reply": _friendly_db_error("suất chiếu"), "actions": [_staff_action("Xác thực vé", "Index")]}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Attendance — chỉ quản lý ca, có dữ liệu thực hôm nay
 # ─────────────────────────────────────────────────────────────────────────────
-def _staff_attendance(role: Optional[str], now: datetime) -> dict:
+def _staff_attendance(role: Optional[str], now: datetime, message: str = "hôm nay", nm: str = "hom nay") -> dict:
     if not _is_shiftmanager(role):
         return {
-            "reply": "Chức năng chấm công chỉ dành cho Quản lý ca. Bạn không có quyền truy cập.",
+            "reply": "Chấm công chỉ dành cho Quản lý ca. Tài khoản nhân viên bán vé không có quyền truy cập mục này.",
             "actions": [_staff_action("Trang nhân viên", "Index")],
         }
 
@@ -399,8 +516,20 @@ def _staff_attendance(role: Optional[str], now: datetime) -> dict:
         WHERE a.CheckIn >= ? AND a.CheckIn < ?
     """
     try:
+        json_reply = _attendance_from_json(message, nm, now)
+        if json_reply is not None:
+            return json_reply
+
         with get_conn() as conn:
             c = conn.cursor()
+            if not _table_exists(c, "Attendance"):
+                return {
+                    "reply": (
+                        "Dữ liệu chấm công của web đang lưu trong App_Data/attendance.json, "
+                        "không phải bảng SQL Attendance. Mình chưa truy cập được file này từ chatbot service hiện tại."
+                    ),
+                    "actions": [_staff_action("Chấm công", "Attendance")],
+                }
             c.execute(sql, today_utc_s, today_utc_e)
             rows = c.fetchall()
             c.execute(sql_total, today_utc_s, today_utc_e)
@@ -431,7 +560,7 @@ def _staff_attendance(role: Optional[str], now: datetime) -> dict:
         }
     except Exception as e:
         return {
-            "reply": f"Lỗi tải dữ liệu chấm công: {e}",
+            "reply": _friendly_db_error("chấm công"),
             "actions": [_staff_action("Chấm công", "Attendance")],
         }
 
@@ -449,6 +578,7 @@ def _staff_stats(now: datetime) -> dict:
     """
 
     try:
+        json_records = _load_attendance_json_records()
         with get_conn() as conn:
             c = conn.cursor()
 
@@ -458,16 +588,31 @@ def _staff_stats(now: datetime) -> dict:
             c.execute(sql_by_role)
             roles = c.fetchall()
 
-            today_utc_s = _vn_to_utc(datetime.combine(now.date(), datetime.min.time()))
-            today_utc_e = today_utc_s + timedelta(days=1)
-            c.execute(sql_checkin_today, today_utc_s, today_utc_e)
-            checkin_today = int(c.fetchone().cnt or 0)
+            if json_records is not None:
+                today_utc_s = _vn_to_utc(datetime.combine(now.date(), datetime.min.time()))
+                today_utc_e = today_utc_s + timedelta(days=1)
+                checked_ids = set()
+                for item in json_records:
+                    check_in = _parse_attendance_datetime(item.get("CheckIn") or item.get("checkIn"))
+                    if check_in and today_utc_s <= check_in < today_utc_e:
+                        checked_ids.add(item.get("StaffId") or item.get("staffId"))
+                checkin_today = len([x for x in checked_ids if x])
+            elif _table_exists(c, "Attendance"):
+                today_utc_s = _vn_to_utc(datetime.combine(now.date(), datetime.min.time()))
+                today_utc_e = today_utc_s + timedelta(days=1)
+                c.execute(sql_checkin_today, today_utc_s, today_utc_e)
+                checkin_today = int(c.fetchone().cnt or 0)
+            else:
+                checkin_today = None
 
         lines = [f"Thống kê nhân viên ({now.strftime('%d/%m/%Y')}):"]
         lines.append(f"- Tổng số nhân viên: {total_staff} người.")
         for r in roles:
             lines.append(f"  • {r.Role or 'Chưa phân vai'}: {int(r.cnt)} người")
-        lines.append(f"- Đã check-in hôm nay: {checkin_today} người.")
+        if checkin_today is None:
+            lines.append("- Dữ liệu check-in đang lưu bằng App_Data/attendance.json; chatbot chưa đọc được file này trong môi trường hiện tại.")
+        else:
+            lines.append(f"- Đã check-in hôm nay: {checkin_today} người.")
 
         return {
             "reply": "\n".join(lines),
@@ -475,7 +620,7 @@ def _staff_stats(now: datetime) -> dict:
         }
     except Exception as e:
         return {
-            "reply": f"Lỗi tải thống kê nhân viên: {e}",
+            "reply": _friendly_db_error("thống kê nhân viên"),
             "actions": [_staff_action("Trang nhân viên", "Index")],
         }
 
@@ -549,7 +694,7 @@ def try_build_staff_reply(message: str, role: Optional[str], now: datetime) -> O
 
     # ── Chấm công (chỉ quản lý ca) ───────────────────────────────────────────
     if _is_attendance_q(nm):
-        return _staff_attendance(role, now)
+        return _staff_attendance(role, now, message, nm)
 
     # ── Suất chiếu / ghế ─────────────────────────────────────────────────────
     if _is_seat_status_q(nm) or _is_showtime_q(nm):

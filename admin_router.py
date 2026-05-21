@@ -1235,25 +1235,33 @@ def _build_bulk_needs(movies, start_date, days, per_day_count, total_count, per_
 
 
 def _try_schedule(need, rooms, slots, now) -> tuple:
-    """Port of TryScheduleBulkShowtime — returns (item_dict, None) or (None, skip_reason)."""
+    """Port of TryScheduleBulkShowtime — returns (item_dict, None) or (None, skip_reason).
+    If all candidate times for the requested date are already past, automatically tries
+    the next day (only when the requested date is today or earlier)."""
     candidate_times = _bulk_candidate_times(need["seq"], need["daily_total"])
     n = len(rooms)
     offset = need["seq"] % n
     rotated = rooms[offset:] + rooms[:offset]
 
-    for t in candidate_times:
-        start_time = datetime.combine(need["date"], t)
-        if start_time < now + timedelta(minutes=15):
-            continue
-        for room in rotated:
-            if room.get("status") in ("Bảo trì", "Tạm đóng"):
+    # If requested date is today or in the past, also try tomorrow as fallback
+    dates_to_try = [need["date"]]
+    if need["date"] <= now.date():
+        dates_to_try.append(need["date"] + timedelta(days=1))
+
+    for attempt_date in dates_to_try:
+        for t in candidate_times:
+            start_time = datetime.combine(attempt_date, t)
+            if start_time < now + timedelta(minutes=15):
                 continue
-            if _find_schedule_conflict(room["id"], start_time, need["duration"], slots) is not None:
-                continue
-            return ({"movie_id": need["movie_id"], "movie_title": need["movie_title"],
-                     "room_id": room["id"], "room_name": room["name"],
-                     "start_time": start_time, "duration": need["duration"], "price": need["price"]},
-                    None)
+            for room in rotated:
+                if room.get("status") in ("Bảo trì", "Tạm đóng"):
+                    continue
+                if _find_schedule_conflict(room["id"], start_time, need["duration"], slots) is not None:
+                    continue
+                return ({"movie_id": need["movie_id"], "movie_title": need["movie_title"],
+                         "room_id": room["id"], "room_name": room["name"],
+                         "start_time": start_time, "duration": need["duration"], "price": need["price"]},
+                        None)
 
     skip = (f"{need['movie_title']} ngày {need['date'].strftime('%d/%m/%Y')}: "
             "không còn khung giờ/phòng trống phù hợp.")
