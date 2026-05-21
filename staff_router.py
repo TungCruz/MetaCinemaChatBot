@@ -102,6 +102,28 @@ def _friendly_db_error(area: str) -> str:
     )
 
 
+def _is_dashboard_q(nm: str) -> bool:
+    """Chỉ hiển thị dashboard khi người dùng yêu cầu rõ ràng (Fix #5 + #7)."""
+    return any(kw in nm for kw in [
+        "tong quan", "dashboard", "tinh hinh hom nay", "hom nay the nao",
+        "cap nhat nhanh", "tom tat", "van hanh hom nay", "ca hien tai",
+        "bao cao nhanh", "update nhanh", "xem nhanh",
+    ])
+
+
+def _staff_safe_actions(result: dict, fallback: str = "Index") -> dict:
+    """FIX #4: Thay thế action URL /Admin/Admin/... → /Staff/Staff/... cho context nhân viên."""
+    if not result:
+        return result
+    fixed = []
+    for a in result.get("actions", []):
+        url = a.get("url", "")
+        if "/Admin/Admin/" in url:
+            a = {**a, "url": f"/Staff/Staff/{fallback}"}
+        fixed.append(a)
+    return {**result, "actions": fixed}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Role sets  (normalized via normalize() — removes diacritics, lowercase)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -152,6 +174,8 @@ def _is_attendance_q(nm: str) -> bool:
         "lam duoc bao nhieu phut", "lam duoc bao nhieu gio", "tien luong",
         "luong hom nay", "so gio lam", "gio cong", "da lam duoc",
         "hom nay lam", "lam bao nhieu", "cong hom nay",
+        # FIX #8: thêm "mấy tiếng" / "bao nhiêu tiếng"
+        "may tieng", "bao nhieu tieng", "lam may tieng",
     ])
 
 
@@ -241,21 +265,45 @@ def _parse_attendance_datetime(value) -> Optional[datetime]:
 def _extract_staff_name(message: str, nm: str) -> Optional[str]:
     """Trích xuất tên/username nhân viên từ câu hỏi.
     Ví dụ: 'nhân viên tung1 hôm nay làm bao nhiêu' → 'tung1'
+            'nhân viên bảo thiên làm mấy tiếng' → 'bao thien'
+            'tung1 đã check-in chưa' → 'tung1'
     """
-    # Thử pattern: "nhân viên <name>" hoặc "nv <name>"
+    # Từ phổ biến không phải tên người
+    _STOP = {
+        "hom", "nay", "tuan", "thang", "ca", "gio", "phut", "tien", "luong",
+        "co", "ten", "da", "chua", "bao", "nhieu", "lam", "cong", "xem",
+        "kiem", "tra", "tat", "hay", "va", "the", "nao", "moi", "la",
+        "duoc", "cac", "het", "qua", "sao", "dau", "biet", "can", "tim",
+        "may", "tieng", "ngay", "toi", "ho", "ban", "minh",
+    }
+
     for pat in [
-        r"nhan vien\s+([a-z0-9_]+)",
-        r"\bnv\s+([a-z0-9_]+)",
-        r"cua\s+([a-z0-9_]+)\s+(?:hom nay|tuan|thang)",
-        r"([a-z0-9_]+)\s+(?:hom nay|tuan nay|thang nay)\s+(?:lam|cong|gio)",
+        # "nhân viên bảo thiên" hoặc "nhân viên tung1" — hỗ trợ tên 2 từ
+        r"nhan vien\s+([a-z0-9_]+(?:\s+[a-z0-9_]+)?)",
+        r"\bnv\s+([a-z0-9_]+(?:\s+[a-z0-9_]+)?)",
+        # "của tung1 hôm nay"
+        r"cua\s+([a-z0-9_]+(?:\s+[a-z0-9_]+)?)\s+(?:hom nay|tuan|thang)",
+        # "tung1 hôm nay làm/cong/gio"
+        r"([a-z0-9_]+)\s+(?:hom nay|tuan nay|thang nay)\s+(?:lam|cong|gio|may|bao)",
+        # "tung1 đã làm/lương bao nhiêu"
         r"([a-z0-9_]+)\s+(?:da lam|lam duoc|lam bao nhieu|cong bao nhieu)",
+        # FIX #2: "tung1 đã check-in chưa?" / "tung1 check-out chưa?"
+        r"([a-z0-9_]+)\s+(?:da\s+)?(?:check in|check out|cham cong|diem danh)",
+        # "xem chấm công của tung1"
+        r"cham cong\s+(?:cua\s+)?([a-z0-9_]+)",
+        # "giờ làm của tung1"
+        r"gio lam\s+(?:cua\s+)?([a-z0-9_]+)",
     ]:
         m = re.search(pat, nm)
         if m:
-            candidate = m.group(1)
-            # Bỏ qua các từ khóa thông thường
-            if candidate not in {"hom", "nay", "tuan", "thang", "ca", "gio", "phut", "tien", "luong"}:
-                return candidate
+            candidate = m.group(1).strip()
+            # Với tên 2 từ: kiểm tra từng từ, loại nếu từ đầu là stop word
+            words = candidate.split()
+            first = words[0]
+            if first in _STOP or len(first) < 2:
+                continue
+            # Trả tên đầy đủ (tối đa 2 từ) để API hỗ trợ tìm kiếm substring
+            return " ".join(words[:2]) if len(words) >= 2 and words[1] not in _STOP else first
     return None
 
 
@@ -372,7 +420,7 @@ def _attendance_from_json(message: str, nm: str, now: datetime, action_url: str 
     if records is None:
         return None
 
-    rng = _build_report_range(message, nm, now, "week")
+    rng = _build_report_range(message, nm, now, "day")  # đồng nhất với _staff_attendance
     start_utc = rng["start_utc"]
     end_utc   = rng["end_utc"]
     filtered  = []
@@ -681,6 +729,25 @@ def _staff_stats(now: datetime) -> dict:
             c.execute(sql_by_role)
             roles = c.fetchall()
 
+        # FIX #6: Tìm ai chưa check-out (đang làm ca) từ dữ liệu attendance
+        still_working: list[str] = []
+        if api_records is not None:
+            still_working = [
+                r.get("StaffName") or r.get("staffName") or f"ID#{r.get('StaffId','?')}"
+                for r in api_records
+                if not (r.get("CheckOut") or r.get("checkOut"))
+            ]
+        elif json_records is not None:
+            today_utc_s_sw = _vn_to_utc(datetime.combine(now.date(), datetime.min.time()))
+            today_utc_e_sw = today_utc_s_sw + timedelta(days=1)
+            for item in json_records:
+                ci = _parse_attendance_datetime(item.get("CheckIn") or item.get("checkIn"))
+                if ci and today_utc_s_sw <= ci < today_utc_e_sw:
+                    if not (item.get("CheckOut") or item.get("checkOut")):
+                        still_working.append(
+                            item.get("StaffName") or item.get("staffName") or f"ID#{item.get('StaffId','?')}"
+                        )
+
         lines = [f"Thống kê nhân viên ({now.strftime('%d/%m/%Y')}):"]
         lines.append(f"- Tổng số nhân viên: {total_staff} người.")
         for r in roles:
@@ -689,6 +756,8 @@ def _staff_stats(now: datetime) -> dict:
             lines.append("- Chưa có dữ liệu check-in hôm nay.")
         else:
             lines.append(f"- Đã check-in hôm nay: {checkin_today} người.")
+        if still_working:
+            lines.append(f"- Đang làm việc (chưa check-out): {', '.join(still_working[:8])}.")
 
         return {
             "reply": "\n".join(lines),
@@ -793,13 +862,22 @@ def try_build_staff_reply(message: str, role: Optional[str], now: datetime) -> O
 
     # ── Đồ ăn/uống ───────────────────────────────────────────────────────────
     if _is_food_q(nm):
-        return _food(message, nm, now)
+        # FIX #4: _food() từ admin_router trả /Admin/Admin/FoodAndDrinks → override
+        result = _food(message, nm, now)
+        return _staff_safe_actions(result, "Sales")
 
     # ── Thanh toán ───────────────────────────────────────────────────────────
     if _is_payment_q(nm):
-        return _payment(message, nm, now)
+        # FIX #4: _payment() trả /Admin/Admin/Index → override sang staff
+        result = _payment(message, nm, now)
+        return _staff_safe_actions(result, "Index")
 
-    # ── Dashboard mặc định (phân theo role) ─────────────────────────────────
-    if is_manager:
-        return _staff_dashboard_full(now)
-    return _staff_dashboard_basic(now)
+    # ── Dashboard — chỉ khi yêu cầu rõ ràng (FIX #5 + #7) ──────────────────
+    if _is_dashboard_q(nm):
+        if is_manager:
+            return _staff_dashboard_full(now)
+        return _staff_dashboard_basic(now)
+
+    # ── Không nhận dạng được intent → fall sang Gemini (FIX #5) ─────────────
+    # Gemini sẽ dùng KB của rạp để trả lời câu hỏi tổng quát
+    return None
