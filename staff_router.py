@@ -9,6 +9,8 @@ Role-based access:
 import re
 import json
 import os
+import urllib.request
+import urllib.parse
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -18,6 +20,10 @@ from admin_router import (
     _build_report_range, _fmt_money, _vn_to_utc,
     _counter_sales, _payment, _food,
 )
+
+# URL gốc của web C# (set trong .env khi deploy: WEB_BASE_URL=https://rapchieuphim.somee.com)
+_WEB_BASE_URL = os.getenv("WEB_BASE_URL", "").rstrip("/")
+_INTERNAL_SECRET = os.getenv("INTERNAL_SECRET") or os.getenv("CHATBOT_INTERNAL_SECRET", "")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -133,7 +139,12 @@ def _is_showtime_q(nm: str) -> bool:
 
 
 def _is_attendance_q(nm: str) -> bool:
-    return any(kw in nm for kw in ["cham cong", "check in", "check out", "ca lam", "gio lam", "diem danh"])
+    return any(kw in nm for kw in [
+        "cham cong", "check in", "check out", "ca lam", "gio lam", "diem danh",
+        "lam duoc bao nhieu phut", "lam duoc bao nhieu gio", "tien luong",
+        "luong hom nay", "so gio lam", "gio cong", "da lam duoc",
+        "hom nay lam", "lam bao nhieu", "cong hom nay",
+    ])
 
 
 def _is_counter_sale_q(nm: str) -> bool:
@@ -208,6 +219,53 @@ def _parse_attendance_datetime(value) -> Optional[datetime]:
     return None
 
 
+def _extract_staff_name(message: str, nm: str) -> Optional[str]:
+    """Trích xuất tên/username nhân viên từ câu hỏi.
+    Ví dụ: 'nhân viên tung1 hôm nay làm bao nhiêu' → 'tung1'
+    """
+    # Thử pattern: "nhân viên <name>" hoặc "nv <name>"
+    for pat in [
+        r"nhan vien\s+([a-z0-9_]+)",
+        r"\bnv\s+([a-z0-9_]+)",
+        r"cua\s+([a-z0-9_]+)\s+(?:hom nay|tuan|thang)",
+        r"([a-z0-9_]+)\s+(?:hom nay|tuan nay|thang nay)\s+(?:lam|cong|gio)",
+        r"([a-z0-9_]+)\s+(?:da lam|lam duoc|lam bao nhieu|cong bao nhieu)",
+    ]:
+        m = re.search(pat, nm)
+        if m:
+            candidate = m.group(1)
+            # Bỏ qua các từ khóa thông thường
+            if candidate not in {"hom", "nay", "tuan", "thang", "ca", "gio", "phut", "tien", "luong"}:
+                return candidate
+    return None
+
+
+def _fetch_attendance_via_api(from_date: datetime, to_date: datetime,
+                               staff_name: Optional[str] = None) -> Optional[list[dict]]:
+    """Gọi /Api/ChatbotAttendanceData trên C# web để lấy dữ liệu attendance.json.
+    Trả về list[dict] hoặc None nếu không gọi được.
+    """
+    if not _WEB_BASE_URL:
+        return None
+    try:
+        params = {
+            "from": from_date.strftime("%Y-%m-%d"),
+            "to":   to_date.strftime("%Y-%m-%d"),
+        }
+        if staff_name:
+            params["staffName"] = staff_name
+        url = f"{_WEB_BASE_URL}/Api/ChatbotAttendanceData?{urllib.parse.urlencode(params)}"
+        headers = {"X-Internal-Secret": _INTERNAL_SECRET} if _INTERNAL_SECRET else {}
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if data.get("success") and isinstance(data.get("items"), list):
+                return data["items"]
+    except Exception:
+        pass
+    return None
+
+
 def _attendance_file_candidates() -> list[Path]:
     here = Path(__file__).resolve()
     env_path = os.getenv("ATTENDANCE_JSON_PATH", "").strip()
@@ -234,15 +292,71 @@ def _load_attendance_json_records() -> Optional[list[dict]]:
     return None
 
 
-def _attendance_from_json(message: str, nm: str, now: datetime, action_url: str = "Attendance") -> Optional[dict]:
+def _format_attendance_records(records: list[dict], label: str, staff_name_filter: Optional[str],
+                                now: datetime, action_url: str = "Attendance") -> dict:
+    """Format danh sách bản ghi chấm công thành reply tiếng Việt."""
+    total_hours  = sum(float(r.get("Hours") or r.get("hours") or 0) for r in records)
+    total_amount = sum(float(r.get("Amount") or r.get("amount") or 0) for r in records)
+    staff_ids    = {r.get("StaffId") or r.get("staffId") for r in records}
+    open_shifts  = sum(1 for r in records if not (r.get("CheckOut") or r.get("checkOut")))
+
+    # --- Hiển thị chi tiết 1 nhân viên cụ thể ---
+    if staff_name_filter and len(records) > 0:
+        lines = [f"Thông tin chấm công của {records[0].get('StaffName') or staff_name_filter} {label.lower()}:"]
+        for r in records[:5]:
+            ci = _parse_attendance_datetime(r.get("CheckIn") or r.get("checkIn"))
+            co = _parse_attendance_datetime(r.get("CheckOut") or r.get("checkOut"))
+            ci_str = (ci + timedelta(hours=7)).strftime("%H:%M %d/%m") if ci else "—"
+            co_str = (co + timedelta(hours=7)).strftime("%H:%M") if co else "đang làm"
+            hrs    = float(r.get("Hours") or r.get("hours") or 0)
+            mins   = round(hrs * 60)
+            amt    = float(r.get("Amount") or r.get("amount") or 0)
+            rate   = float(r.get("HourlyRate") or r.get("hourlyRate") or 0)
+            lines.append(
+                f"- Vào {ci_str} → Ra {co_str} | {mins} phút ({hrs:.2f}h)"
+                + (f" | Lương: {_fmt_money(amt)}" if amt > 0 else "")
+                + (f" | Đơn giá: {_fmt_money(rate)}/h" if rate > 0 else "")
+            )
+        if open_shifts:
+            lines.append(f"⚠ {open_shifts} ca chưa checkout.")
+        lines.append(f"Tổng: {round(total_hours * 60)} phút ({total_hours:.2f}h) — {_fmt_money(total_amount)}.")
+        return {"reply": "\n".join(lines), "actions": [_staff_action("Chấm công", action_url)]}
+
+    # --- Tổng hợp nhiều nhân viên ---
+    lines = [
+        f"Tổng hợp chấm công {label.lower()}:",
+        f"- {len(records)} lượt, {len([x for x in staff_ids if x])} nhân viên, {open_shifts} ca đang mở.",
+        f"- Tổng giờ: {total_hours:.2f}h | Tiền công: {_fmt_money(total_amount)}.",
+    ]
+    from collections import defaultdict
+    by_staff: dict = defaultdict(lambda: {"hours": 0.0, "amount": 0.0, "open": 0, "name": ""})
+    for r in records:
+        key = r.get("StaffId") or r.get("staffId") or r.get("StaffName") or r.get("staffName") or "unknown"
+        b = by_staff[key]
+        b["name"] = r.get("StaffName") or r.get("staffName") or "Nhân viên"
+        b["hours"]  += float(r.get("Hours")  or r.get("hours")  or 0)
+        b["amount"] += float(r.get("Amount") or r.get("amount") or 0)
+        if not (r.get("CheckOut") or r.get("checkOut")):
+            b["open"] += 1
+    top = sorted(by_staff.values(), key=lambda x: x["hours"], reverse=True)[:5]
+    if top:
+        lines.append("Theo nhân viên:")
+        for item in top:
+            extra = f", {item['open']} ca đang mở" if item["open"] else ""
+            lines.append(f"- {item['name']}: {item['hours']:.2f}h — {_fmt_money(item['amount'])}{extra}.")
+    return {"reply": "\n".join(lines), "actions": [_staff_action("Chấm công", action_url)]}
+
+
+def _attendance_from_json(message: str, nm: str, now: datetime, action_url: str = "Attendance",
+                           staff_name_filter: Optional[str] = None) -> Optional[dict]:
     records = _load_attendance_json_records()
     if records is None:
         return None
 
     rng = _build_report_range(message, nm, now, "week")
     start_utc = rng["start_utc"]
-    end_utc = rng["end_utc"]
-    filtered = []
+    end_utc   = rng["end_utc"]
+    filtered  = []
     for item in records:
         check_in = _parse_attendance_datetime(item.get("CheckIn") or item.get("checkIn"))
         if not check_in or check_in < start_utc or check_in >= end_utc:
@@ -250,38 +364,14 @@ def _attendance_from_json(message: str, nm: str, now: datetime, action_url: str 
         role = item.get("Role") or item.get("role") or ""
         if normalize(role) == "admin":
             continue
-        filtered.append((item, check_in))
+        if staff_name_filter:
+            name = (item.get("StaffName") or item.get("staffName") or "").lower()
+            sid  = str(item.get("StaffId") or item.get("staffId") or "").lower()
+            if staff_name_filter.lower() not in name and staff_name_filter.lower() not in sid:
+                continue
+        filtered.append(item)
 
-    total_hours = sum(float((item.get("Hours") or item.get("hours") or 0) or 0) for item, _ in filtered)
-    total_amount = sum(float((item.get("Amount") or item.get("amount") or 0) or 0) for item, _ in filtered)
-    staff_ids = {item.get("StaffId") or item.get("staffId") for item, _ in filtered}
-    open_shifts = sum(1 for item, _ in filtered if not (item.get("CheckOut") or item.get("checkOut")))
-
-    lines = [
-        f"Tổng hợp chấm công {rng['label'].lower()}:",
-        f"- {len(filtered)} lượt chấm công, {len([x for x in staff_ids if x])} nhân viên, {open_shifts} ca đang mở.",
-        f"- Tổng giờ: {total_hours:.2f}h; tiền công tạm tính: {_fmt_money(total_amount)}.",
-    ]
-
-    from collections import defaultdict
-    by_staff = defaultdict(lambda: {"hours": 0.0, "amount": 0.0, "open": 0, "name": ""})
-    for item, _ in filtered:
-        key = item.get("StaffId") or item.get("staffId") or item.get("StaffName") or item.get("staffName") or "unknown"
-        bucket = by_staff[key]
-        bucket["name"] = item.get("StaffName") or item.get("staffName") or "Nhân viên"
-        bucket["hours"] += float((item.get("Hours") or item.get("hours") or 0) or 0)
-        bucket["amount"] += float((item.get("Amount") or item.get("amount") or 0) or 0)
-        if not (item.get("CheckOut") or item.get("checkOut")):
-            bucket["open"] += 1
-
-    top_staff = sorted(by_staff.values(), key=lambda x: x["hours"], reverse=True)[:5]
-    if top_staff:
-        lines.append("Theo nhân viên:")
-        for item in top_staff:
-            extra = f", {item['open']} ca đang mở" if item["open"] else ""
-            lines.append(f"- {item['name']}: {item['hours']:.2f}h, {_fmt_money(item['amount'])}{extra}.")
-
-    return {"reply": "\n".join(lines), "actions": [_staff_action("Chấm công", action_url)]}
+    return _format_attendance_records(filtered, rng["label"], staff_name_filter, now, action_url)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -494,75 +584,42 @@ def _staff_attendance(role: Optional[str], now: datetime, message: str = "hôm n
             "actions": [_staff_action("Trang nhân viên", "Index")],
         }
 
-    today_start = datetime.combine(now.date(), datetime.min.time())
-    today_end   = today_start + timedelta(days=1)
-    today_utc_s = _vn_to_utc(today_start)
-    today_utc_e = today_utc_s + timedelta(days=1)
+    staff_name = _extract_staff_name(message, nm)
+    rng        = _build_report_range(message, nm, now, "day")
+    from_date  = rng["start_utc"].date() if hasattr(rng.get("start_utc"), "date") else now.date()
+    to_date    = rng["end_utc"].date()   if hasattr(rng.get("end_utc"),   "date") else now.date()
 
-    sql = """
-        SELECT a.StaffName, a.Role,
-               a.CheckIn, a.CheckOut,
-               ISNULL(a.Hours, 0) AS hours,
-               ISNULL(a.Amount, 0) AS amount
-        FROM Attendance a
-        WHERE a.CheckIn >= ? AND a.CheckIn < ?
-        ORDER BY a.CheckIn
-    """
-    sql_total = """
-        SELECT COUNT(*) AS cnt,
-               ISNULL(SUM(a.Hours), 0) AS total_hours,
-               ISNULL(SUM(a.Amount), 0) AS total_amount
-        FROM Attendance a
-        WHERE a.CheckIn >= ? AND a.CheckIn < ?
-    """
+    # ── 1. Thử gọi HTTP API (khi deploy trên Render) ─────────────────────────
     try:
-        json_reply = _attendance_from_json(message, nm, now)
-        if json_reply is not None:
-            return json_reply
-
-        with get_conn() as conn:
-            c = conn.cursor()
-            if not _table_exists(c, "Attendance"):
+        api_records = _fetch_attendance_via_api(
+            datetime.combine(from_date, datetime.min.time()),
+            datetime.combine(to_date,   datetime.min.time()),
+            staff_name,
+        )
+        if api_records is not None:
+            if not api_records:
+                who = f" của {staff_name}" if staff_name else ""
                 return {
-                    "reply": (
-                        "Dữ liệu chấm công của web đang lưu trong App_Data/attendance.json, "
-                        "không phải bảng SQL Attendance. Mình chưa truy cập được file này từ chatbot service hiện tại."
-                    ),
+                    "reply": f"Chưa có dữ liệu chấm công{who} trong khoảng thời gian này.",
                     "actions": [_staff_action("Chấm công", "Attendance")],
                 }
-            c.execute(sql, today_utc_s, today_utc_e)
-            rows = c.fetchall()
-            c.execute(sql_total, today_utc_s, today_utc_e)
-            tot = c.fetchone()
+            return _format_attendance_records(api_records, rng["label"], staff_name, now)
+    except Exception:
+        pass
 
-        cnt_staff    = int(tot.cnt or 0)
-        total_hours  = float(tot.total_hours or 0)
-        total_amount = float(tot.total_amount or 0)
+    # ── 2. Thử đọc file JSON local (môi trường dev) ──────────────────────────
+    json_reply = _attendance_from_json(message, nm, now, staff_name_filter=staff_name)
+    if json_reply is not None:
+        return json_reply
 
-        lines = [f"Chấm công hôm nay ({now.strftime('%d/%m/%Y')}): {cnt_staff} lượt."]
-        if not rows:
-            lines.append("Chưa có nhân viên nào check-in hôm nay.")
-        else:
-            for r in rows[:10]:
-                checkin_vn  = r.CheckIn  + timedelta(hours=7)
-                checkout_vn = (r.CheckOut + timedelta(hours=7)).strftime("%H:%M") if r.CheckOut else "—"
-                hrs = f"{float(r.hours or 0):.1f}h"
-                lines.append(
-                    f"- {r.StaffName} ({r.Role}): vào {checkin_vn.strftime('%H:%M')} — ra {checkout_vn} | {hrs} | {_fmt_money(float(r.amount or 0))}"
-                )
-            if len(rows) > 10:
-                lines.append(f"Còn {len(rows) - 10} nhân viên khác.")
-            lines.append(f"Tổng: {total_hours:.1f} giờ — {_fmt_money(total_amount)}.")
-
-        return {
-            "reply": "\n".join(lines),
-            "actions": [_staff_action("Trang chấm công", "Attendance")],
-        }
-    except Exception as e:
-        return {
-            "reply": _friendly_db_error("chấm công"),
-            "actions": [_staff_action("Chấm công", "Attendance")],
-        }
+    # ── 3. Báo lỗi rõ ràng — không còn thông báo kỹ thuật lộ ra ngoài ───────
+    return {
+        "reply": (
+            "Mình chưa đọc được dữ liệu chấm công lúc này. "
+            "Bạn có thể mở trang Chấm công để xem trực tiếp."
+        ),
+        "actions": [_staff_action("Chấm công", "Attendance")],
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -578,39 +635,39 @@ def _staff_stats(now: datetime) -> dict:
     """
 
     try:
-        json_records = _load_attendance_json_records()
-        with get_conn() as conn:
-            c = conn.cursor()
-
-            c.execute(sql_total)
-            total_staff = int(c.fetchone()[0] or 0)
-
-            c.execute(sql_by_role)
-            roles = c.fetchall()
-
+        # Lấy dữ liệu check-in hôm nay: ưu tiên API → file JSON → bỏ qua
+        today_start = datetime.combine(now.date(), datetime.min.time())
+        api_records = _fetch_attendance_via_api(today_start, today_start)
+        if api_records is not None:
+            checked_ids = {r.get("StaffId") or r.get("staffId") for r in api_records if r}
+            checkin_today = len([x for x in checked_ids if x])
+        else:
+            json_records = _load_attendance_json_records()
             if json_records is not None:
-                today_utc_s = _vn_to_utc(datetime.combine(now.date(), datetime.min.time()))
+                today_utc_s = _vn_to_utc(today_start)
                 today_utc_e = today_utc_s + timedelta(days=1)
                 checked_ids = set()
                 for item in json_records:
-                    check_in = _parse_attendance_datetime(item.get("CheckIn") or item.get("checkIn"))
-                    if check_in and today_utc_s <= check_in < today_utc_e:
+                    ci = _parse_attendance_datetime(item.get("CheckIn") or item.get("checkIn"))
+                    if ci and today_utc_s <= ci < today_utc_e:
                         checked_ids.add(item.get("StaffId") or item.get("staffId"))
                 checkin_today = len([x for x in checked_ids if x])
-            elif _table_exists(c, "Attendance"):
-                today_utc_s = _vn_to_utc(datetime.combine(now.date(), datetime.min.time()))
-                today_utc_e = today_utc_s + timedelta(days=1)
-                c.execute(sql_checkin_today, today_utc_s, today_utc_e)
-                checkin_today = int(c.fetchone().cnt or 0)
             else:
                 checkin_today = None
+
+        with get_conn() as conn:
+            c = conn.cursor()
+            c.execute(sql_total)
+            total_staff = int(c.fetchone()[0] or 0)
+            c.execute(sql_by_role)
+            roles = c.fetchall()
 
         lines = [f"Thống kê nhân viên ({now.strftime('%d/%m/%Y')}):"]
         lines.append(f"- Tổng số nhân viên: {total_staff} người.")
         for r in roles:
             lines.append(f"  • {r.Role or 'Chưa phân vai'}: {int(r.cnt)} người")
         if checkin_today is None:
-            lines.append("- Dữ liệu check-in đang lưu bằng App_Data/attendance.json; chatbot chưa đọc được file này trong môi trường hiện tại.")
+            lines.append("- Chưa có dữ liệu check-in hôm nay.")
         else:
             lines.append(f"- Đã check-in hôm nay: {checkin_today} người.")
 
