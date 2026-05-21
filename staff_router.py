@@ -39,7 +39,9 @@ _STAFF_SYNONYM_GROUPS: list[tuple[list[str], str]] = [
     # ── Lịch chiếu hôm nay ───────────────────────────────────────────────
     (["lich phim", "phim hom nay", "suat hom nay",
       "buoi chieu hom nay", "xem lich", "lich chieu hom nay",
-      "hom nay chieu gi", "chieu gi hom nay"], "lich hom nay"),
+      "hom nay chieu gi", "chieu gi hom nay",
+      "suat tiep theo", "suat ke tiep", "buoi tiep theo",
+      "chieu tiep theo", "suat gan nhat", "con suat nao"], "lich hom nay"),
 
     # ── Chấm công / ca làm ───────────────────────────────────────────────
     (["nghi phep", "vang mat", "ngay cong",
@@ -76,7 +78,11 @@ _STAFF_SYNONYM_GROUPS: list[tuple[list[str], str]] = [
     # ── Thống kê nhân viên (quản lý ca) ─────────────────────────────────
     (["ai lam hom nay", "danh sach nhan vien hom nay",
       "nhan vien truc", "ai truc", "lich nhan vien",
-      "so nhan vien", "bao nhieu nhan vien hom nay"], "nhan vien hom nay"),
+      "so nhan vien", "bao nhieu nhan vien hom nay",
+      "tong so nhan vien", "tong nhan vien",
+      "co bao nhieu nguoi lam", "phan loai nhan vien",
+      "nhan vien theo vai tro", "cac nhan vien",
+      "tat ca nhan vien", "ai dang truc ca"], "nhan vien hom nay"),
 ]
 
 
@@ -134,7 +140,9 @@ def _is_seat_status_q(nm: str) -> bool:
 def _is_showtime_q(nm: str) -> bool:
     return any(kw in nm for kw in [
         "suat chieu", "lich chieu", "gio chieu", "lich hom nay",
-        "lich ngay", "suat nao", "nhung suat", "cac suat"
+        "lich ngay", "suat nao", "nhung suat", "cac suat",
+        "suat tiep theo", "suat ke tiep", "suat gan nhat",
+        "buoi chieu tiep", "chieu tiep theo", "con suat nao",
     ])
 
 
@@ -159,7 +167,13 @@ def _is_ticket_validation_q(nm: str) -> bool:
 
 
 def _is_room_q(nm: str) -> bool:
-    return any(kw in nm for kw in ["phong", "ghe", "bao tri", "tam dong"])
+    # "ghe" chỉ trigger room query khi đi kèm ngữ cảnh phòng chiếu
+    # (tránh bắt nhầm câu hỏi ghế đơn thuần từ khách hàng)
+    if "phong" in nm or "bao tri" in nm or "tam dong" in nm:
+        return True
+    if "ghe" in nm and any(kw in nm for kw in ["phong", "suat", "room", "hong", "loi", "sua"]):
+        return True
+    return False
 
 
 def _is_food_q(nm: str) -> bool:
@@ -185,6 +199,11 @@ def _is_staff_stats_q(nm: str) -> bool:
         "thong ke nhan vien", "nhan su", "danh sach nhan vien",
         "so luong nhan vien", "nhan vien hom nay", "bao nhieu nhan vien",
         "co bao nhieu nguoi", "nhan vien nao",
+        # thêm: "tổng số nhân viên", "metacinema có bao nhiêu nhân viên",
+        # "ai đang trực", "nhân viên theo vai trò"
+        "tong so nhan vien", "tong nhan vien", "bao nhieu nguoi",
+        "ai dang truc", "nhan vien theo vai tro", "phan loai nhan vien",
+        "cac nhan vien", "tat ca nhan vien",
     ])
 
 
