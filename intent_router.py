@@ -278,10 +278,11 @@ def _extract_query_name(nm: str) -> Optional[str]:
     return None
 
 
-def _search_movies_by_keyword(keyword: str, now: datetime) -> list:
-    """Tìm phim có keyword trong Title hoặc Description.
+def _search_movies_by_actor(actor_name: str, now: datetime) -> list:
+    """Tìm phim theo tên nhân vật / diễn viên trong cột MainActors.
+    Nếu không khớp MainActors thì thử Description làm fallback.
     Trả về list movie rows sắp xếp theo relevance."""
-    if not keyword or len(keyword) < 2:
+    if not actor_name or len(actor_name) < 2:
         return []
     try:
         with get_conn() as conn:
@@ -289,7 +290,7 @@ def _search_movies_by_keyword(keyword: str, now: datetime) -> list:
             cursor.execute(
                 """
                 SELECT m.Id, m.Title, m.Genre, m.DurationMinutes, m.Rating,
-                       m.Description, m.ReleaseDate,
+                       m.Description, m.ReleaseDate, m.MainActors,
                        (SELECT MIN(s.StartTime) FROM Showtimes s
                         WHERE s.MovieId = m.Id AND s.StartTime >= ?) AS FirstShowtime
                 FROM Movies m
@@ -300,33 +301,47 @@ def _search_movies_by_keyword(keyword: str, now: datetime) -> list:
     except Exception:
         return []
 
-    kw_norm = normalize(keyword)
-    kw_tokens = [t for t in kw_norm.split() if len(t) >= 2]
-    if not kw_tokens:
+    name_norm = normalize(actor_name)
+    name_tokens = [t for t in name_norm.split() if len(t) >= 2]
+    if not name_tokens:
         return []
 
     matched = []
     for movie in movies:
-        title_norm = normalize(movie.Title or "")
-        desc_norm = normalize(movie.Description or "")
-        searchable = title_norm + " " + desc_norm
+        actors_norm = normalize(movie.MainActors or "")
+        desc_norm   = normalize(movie.Description or "")
 
-        score = 0
-        if kw_norm in searchable:
-            score += len(kw_tokens) * 5
-        score += sum(3 if len(t) >= 5 else 1 for t in kw_tokens if t in searchable)
+        # Ưu tiên tìm trong MainActors — đây là nguồn chính
+        actor_score = 0
+        if name_norm in actors_norm:
+            actor_score += len(name_tokens) * 10   # khớp đầy đủ → điểm cao nhất
+        else:
+            actor_score += sum(5 if len(t) >= 5 else 2
+                               for t in name_tokens if t in actors_norm)
 
-        # Require at least half the tokens to match (allows 1 missing token)
-        threshold = max(1, len(kw_tokens) - 1)
-        if score >= threshold:
-            matched.append((score, movie))
+        # Fallback: tìm trong Description nếu MainActors không có
+        desc_score = 0
+        if actor_score == 0:
+            if name_norm in desc_norm:
+                desc_score += len(name_tokens) * 4
+            else:
+                desc_score += sum(2 if len(t) >= 5 else 1
+                                  for t in name_tokens if t in desc_norm)
 
-    matched.sort(key=lambda x: -x[0])
-    return [m for _, m in matched[:4]]
+        total = actor_score + desc_score
+        # Ngưỡng: phải khớp ít nhất 1 token có nghĩa (≥ 3 ký tự)
+        threshold = max(1, len([t for t in name_tokens if len(t) >= 3]) - 1)
+        if total >= threshold:
+            matched.append((total, actor_score, movie))
+
+    # Sắp xếp: MainActors match trước, sau đó theo total score
+    matched.sort(key=lambda x: (-x[1], -x[0]))
+    return [m for _, _, m in matched[:4]]
 
 
 def _build_character_search_reply(message: str, now: datetime) -> Optional[dict]:
-    """Xây reply cho câu hỏi 'X là nhân vật trong phim nào'.
+    """Xây reply cho câu hỏi 'X là nhân vật / diễn viên trong phim nào'.
+    Tìm trong cột MainActors của Movies.
     Trả về dict nếu tìm được phim trong DB, None để rơi qua Gemini."""
     nm = expand_synonyms(normalize(message))
     if not is_character_search_question(nm):
@@ -336,22 +351,25 @@ def _build_character_search_reply(message: str, now: datetime) -> Optional[dict]
     if not char_name:
         return None
 
-    movies = _search_movies_by_keyword(char_name, now)
+    movies = _search_movies_by_actor(char_name, now)
     if not movies:
-        # Không có trong MetaCinema → Gemini sẽ trả lời (anime, series ngoài hệ thống…)
+        # Không có trong MainActors/Description → Gemini sẽ trả lời
         return None
 
     display_name = char_name.title()
-    lines = [f'Tại MetaCinema, mình tìm được phim liên quan đến **{display_name}**:']
+    lines = [f'Mình tìm thấy phim tại MetaCinema có diễn viên / nhân vật **{display_name}**:']
     actions = []
     for m in movies:
+        actors_str = (m.MainActors or "").strip()
         showtime_part = ""
         if m.FirstShowtime:
             showtime_part = f" | Suất gần nhất: {m.FirstShowtime.strftime('%d/%m %H:%M')}"
         elif m.ReleaseDate:
             rd = m.ReleaseDate.date() if isinstance(m.ReleaseDate, datetime) else m.ReleaseDate
             showtime_part = f" | Dự kiến chiếu: {rd.strftime('%d/%m/%Y')}"
-        lines.append(f"- **{m.Title}**{showtime_part}")
+
+        cast_hint = f" ({actors_str[:60]})" if actors_str else ""
+        lines.append(f"- **{m.Title}**{cast_hint}{showtime_part}")
         actions.append({
             "type": "view_movie",
             "label": f"Xem {m.Title[:22]}",
