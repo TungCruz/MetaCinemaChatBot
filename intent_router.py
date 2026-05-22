@@ -122,9 +122,10 @@ _SYNONYM_GROUPS: list[tuple[list[str], str]] = [
     # Đánh giá tích cực / hỏi review
     (["phim xin", "phim dinh", "phim hot", "phim hay vl",
       "nhieu nguoi khen", "phim trend", "phim noi tieng"], "review phim"),
-    # Phim sắp ra
+    # Phim sắp ra / ngày khởi chiếu
     (["sap ra chua", "bao gio ra rap", "khi nao ra rap",
-      "sap duoc chieu chua"], "sap chieu"),
+      "sap duoc chieu chua", "ngay khoi chieu", "khi nao co lich",
+      "bao gio co suat", "dự kien chieu", "du kien chieu"], "sap chieu"),
 ]
 
 
@@ -343,7 +344,8 @@ def _resolve_requested_movie(nm: str):
             cursor = conn.cursor()
             cursor.execute(
                 """
-                SELECT Id, Title, Genre, DurationMinutes, Rating, Description
+                SELECT Id, Title, Genre, DurationMinutes, Rating, Description,
+                       ReleaseDate, Director
                 FROM Movies
                 """
             )
@@ -480,6 +482,88 @@ def _build_movie_age_reply(message: str, page_context: dict, now: datetime) -> O
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Upcoming release — fallback khi phim chưa có suất chiếu nhưng có ReleaseDate
+# ─────────────────────────────────────────────────────────────────────────────
+def _build_upcoming_release_reply(movie_id: Optional[int], nm: str,
+                                   now: datetime) -> Optional[dict]:
+    """Khi không có Showtime nào, kiểm tra Movies.ReleaseDate.
+    Dùng cho trường hợp: phim sắp chiếu, mục 'Sắp chiếu', câu hỏi 'khi nào chiếu?'
+    """
+    try:
+        with get_conn() as conn:
+            cursor = conn.cursor()
+
+            if movie_id:
+                # Đến từ trang chi tiết phim — biết chính xác ID
+                cursor.execute(
+                    "SELECT Id, Title, Genre, DurationMinutes, Rating, "
+                    "       ReleaseDate, Director "
+                    "FROM Movies WHERE Id = ?",
+                    int(movie_id),
+                )
+                movie = cursor.fetchone()
+            else:
+                # Tìm theo tên trong câu hỏi
+                movie = _resolve_requested_movie(nm)
+
+        if not movie:
+            return None
+
+        release = getattr(movie, "ReleaseDate", None)
+        if not release:
+            return None
+
+        from datetime import date as date_type
+        release_date = release.date() if isinstance(release, datetime) else release
+        today = now.date()
+
+        lines = [f"Phim **{movie.Title}** chưa có suất chiếu cụ thể tại MetaCinema."]
+
+        if release_date > today:
+            delta = (release_date - today).days
+            if delta == 1:
+                countdown = "ngày mai"
+            elif delta <= 7:
+                countdown = f"còn {delta} ngày nữa"
+            elif delta <= 30:
+                countdown = f"còn khoảng {delta // 7} tuần nữa"
+            else:
+                countdown = f"còn khoảng {(delta + 15) // 30} tháng nữa"
+            lines.append(
+                f"- Dự kiến khởi chiếu: **{release_date.strftime('%d/%m/%Y')}** ({countdown})."
+            )
+        else:
+            lines.append(
+                f"- Ngày khởi chiếu: {release_date.strftime('%d/%m/%Y')} "
+                "— lịch suất chưa được cập nhật trên hệ thống."
+            )
+
+        genre = getattr(movie, "Genre", None)
+        duration = getattr(movie, "DurationMinutes", None)
+        director = getattr(movie, "Director", None)
+        if genre:
+            lines.append(f"- Thể loại: {genre}.")
+        if duration:
+            lines.append(f"- Thời lượng: {duration} phút.")
+        if director:
+            lines.append(f"- Đạo diễn: {director}.")
+        lines.append("Theo dõi trang phim để cập nhật lịch chiếu sớm nhất!")
+
+        mid = getattr(movie, "Id", None) or movie_id
+        return {
+            "reply": "\n".join(lines),
+            "actions": [{
+                "type": "view_movie",
+                "label": f"Xem chi tiết {movie.Title[:20]}",
+                "url": f"/Movies/Details/{mid}",
+                "movieId": mid,
+            }],
+        }
+    except Exception:
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Showtime reply
 # ─────────────────────────────────────────────────────────────────────────────
 def _build_showtime_reply(message: str, page_context: dict, now: datetime) -> Optional[dict]:
@@ -527,7 +611,14 @@ def _build_showtime_reply(message: str, page_context: dict, now: datetime) -> Op
         return {"reply": f"Không thể truy vấn lịch chiếu: {e}", "actions": []}
 
     if not rows:
-        return {"reply": "Không tìm thấy suất chiếu phù hợp. Bạn thử hỏi ngày khác hoặc gọi 0799010072 nhé.", "actions": []}
+        # Trước khi báo không tìm thấy — kiểm tra phim có ReleaseDate không (sắp chiếu)
+        upcoming = _build_upcoming_release_reply(page_movie_id, nm, now)
+        if upcoming:
+            return upcoming
+        return {
+            "reply": "Không tìm thấy suất chiếu phù hợp. Bạn thử hỏi ngày khác hoặc gọi 0799010072 nhé.",
+            "actions": [],
+        }
 
     # Detect movie name mentioned in message (when not already on a movie page)
     if not page_movie_id and not global_list:
