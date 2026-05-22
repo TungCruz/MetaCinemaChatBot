@@ -50,10 +50,7 @@ _SYNONYM_GROUPS: list[tuple[list[str], str]] = [
     # ── Nội dung / thông tin phim ─────────────────────────────────────────
     (["cot truyen", "tom tat phim", "tom tat noi dung",
       "noi dung chinh", "kich ban", "nhan vat chinh",
-      "ke ve cai gi", "phim ke ve",
-      # Câu hỏi tra phim theo nhân vật / diễn viên
-      "nhan vat trong", "trong phim nao", "phim nao co nhan vat",
-      "la nhan vat", "xuat hien trong phim", "dong vai"], "noi dung phim"),
+      "ke ve cai gi", "phim ke ve"], "noi dung phim"),
     (["co hay khong", "hay khong", "nen xem khong",
       "dang xem khong", "co dang xem khong", "tot khong",
       "nhu the nao", "the nao", "cam nhan", "danh gia",
@@ -228,6 +225,149 @@ def is_policy_question(nm: str) -> bool:
 
 def is_movie_age_question(nm: str) -> bool:
     return any(kw in nm for kw in _AGE_QUESTION_WORDS)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Character / actor search — "Gojo Satoru là nhân vật trong phim nào?"
+# ─────────────────────────────────────────────────────────────────────────────
+def is_character_search_question(nm: str) -> bool:
+    """Phát hiện câu hỏi tìm phim theo nhân vật hoặc diễn viên."""
+    if "trong phim nao" in nm:
+        return True
+    if "phim nao co nhan vat" in nm or "phim nao co dien vien" in nm:
+        return True
+    if "xuat hien trong phim" in nm or "dong vai trong phim" in nm:
+        return True
+    if "la nhan vat" in nm and "phim" in nm:
+        return True
+    return False
+
+
+_CHAR_STOPS = {
+    "la", "nhan", "vat", "trong", "phim", "nao", "gi", "ai",
+    "co", "o", "mot", "cua", "va", "de", "da", "thi", "voi",
+    "hay", "hoac", "khi", "neu", "va", "cung", "rat",
+}
+
+
+def _extract_query_name(nm: str) -> Optional[str]:
+    """Trích tên nhân vật / diễn viên từ câu hỏi đã normalize.
+    Trả về chuỗi tên (dạng normalize) hoặc None nếu không tìm được."""
+    patterns = [
+        # "gojo satoru la nhan vat trong phim nao"
+        r"^(.+?)\s+la\s+nhan\s+vat",
+        # "gojo satoru xuat hien trong phim nao"
+        r"^(.+?)\s+(?:xuat\s+hien|co\s+mat)\s+trong",
+        # "nhan vat gojo satoru trong phim nao"
+        r"nhan\s+vat\s+(.+?)\s+(?:trong|phim|o)",
+        # "phim nao co nhan vat gojo satoru"
+        r"phim\s+nao\s+co\s+nhan\s+vat\s+(.+?)$",
+        r"phim\s+nao\s+co\s+dien\s+vien\s+(.+?)$",
+        # "gojo satoru dong vai trong phim nao"
+        r"^(.+?)\s+dong\s+vai\s+trong",
+        # generic: "X trong phim nao"
+        r"^(.+?)\s+trong\s+phim\s+nao",
+    ]
+    for pat in patterns:
+        m = re.search(pat, nm)
+        if m:
+            raw = m.group(1).strip()
+            words = [w for w in raw.split() if w not in _CHAR_STOPS and len(w) >= 2]
+            if words:
+                return " ".join(words)
+    return None
+
+
+def _search_movies_by_keyword(keyword: str, now: datetime) -> list:
+    """Tìm phim có keyword trong Title hoặc Description.
+    Trả về list movie rows sắp xếp theo relevance."""
+    if not keyword or len(keyword) < 2:
+        return []
+    try:
+        with get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT m.Id, m.Title, m.Genre, m.DurationMinutes, m.Rating,
+                       m.Description, m.ReleaseDate,
+                       (SELECT MIN(s.StartTime) FROM Showtimes s
+                        WHERE s.MovieId = m.Id AND s.StartTime >= ?) AS FirstShowtime
+                FROM Movies m
+                """,
+                now,
+            )
+            movies = cursor.fetchall()
+    except Exception:
+        return []
+
+    kw_norm = normalize(keyword)
+    kw_tokens = [t for t in kw_norm.split() if len(t) >= 2]
+    if not kw_tokens:
+        return []
+
+    matched = []
+    for movie in movies:
+        title_norm = normalize(movie.Title or "")
+        desc_norm = normalize(movie.Description or "")
+        searchable = title_norm + " " + desc_norm
+
+        score = 0
+        if kw_norm in searchable:
+            score += len(kw_tokens) * 5
+        score += sum(3 if len(t) >= 5 else 1 for t in kw_tokens if t in searchable)
+
+        # Require at least half the tokens to match (allows 1 missing token)
+        threshold = max(1, len(kw_tokens) - 1)
+        if score >= threshold:
+            matched.append((score, movie))
+
+    matched.sort(key=lambda x: -x[0])
+    return [m for _, m in matched[:4]]
+
+
+def _build_character_search_reply(message: str, now: datetime) -> Optional[dict]:
+    """Xây reply cho câu hỏi 'X là nhân vật trong phim nào'.
+    Trả về dict nếu tìm được phim trong DB, None để rơi qua Gemini."""
+    nm = expand_synonyms(normalize(message))
+    if not is_character_search_question(nm):
+        return None
+
+    char_name = _extract_query_name(nm)
+    if not char_name:
+        return None
+
+    movies = _search_movies_by_keyword(char_name, now)
+    if not movies:
+        # Không có trong MetaCinema → Gemini sẽ trả lời (anime, series ngoài hệ thống…)
+        return None
+
+    display_name = char_name.title()
+    lines = [f'Tại MetaCinema, mình tìm được phim liên quan đến **{display_name}**:']
+    actions = []
+    for m in movies:
+        showtime_part = ""
+        if m.FirstShowtime:
+            showtime_part = f" | Suất gần nhất: {m.FirstShowtime.strftime('%d/%m %H:%M')}"
+        elif m.ReleaseDate:
+            rd = m.ReleaseDate.date() if isinstance(m.ReleaseDate, datetime) else m.ReleaseDate
+            showtime_part = f" | Dự kiến chiếu: {rd.strftime('%d/%m/%Y')}"
+        lines.append(f"- **{m.Title}**{showtime_part}")
+        actions.append({
+            "type": "view_movie",
+            "label": f"Xem {m.Title[:22]}",
+            "url": f"/Movies/Details/{m.Id}",
+            "movieId": m.Id,
+        })
+
+    # Thêm nút đặt vé cho phim đang có suất chiếu
+    for m in [mv for mv in movies if mv.FirstShowtime][:2]:
+        next_sts = _next_showtimes_for_movie(m.Id, now, limit=2)
+        actions.extend(_build_showtime_actions(next_sts))
+
+    return {
+        "reply": "\n".join(lines),
+        "actions": actions[:6],
+    }
 
 
 def is_my_tickets_question(nm: str) -> bool:
@@ -1078,6 +1218,17 @@ def try_build_routed_reply(message: str, page_context: dict, user_id: Optional[i
     if is_policy_question(nm):
         logger.info("intent=policy user=%s", user_id)
         return _build_policy_reply(nm)
+
+    # Character / actor search — "X là nhân vật trong phim nào?"
+    # Phải chạy TRƯỚC is_movie_question để tránh character query rơi vào danh sách phim chung
+    if is_character_search_question(nm):
+        char_reply = _build_character_search_reply(message, now)
+        if char_reply is not None:
+            logger.info("intent=character_search user=%s", user_id)
+            return char_reply
+        # Không có trong DB (ví dụ: nhân vật anime) → để Gemini trả lời
+        logger.info("intent=gemini_fallback(character) user=%s msg=%.60r", user_id, message)
+        return None
 
     # Movie info / list
     if is_movie_question(nm):
