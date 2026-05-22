@@ -512,7 +512,7 @@ def _resolve_requested_movie(nm: str):
             cursor.execute(
                 """
                 SELECT Id, Title, Genre, DurationMinutes, Rating, Description,
-                       ReleaseDate, Director
+                       ReleaseDate, Director, MainActors
                 FROM Movies
                 """
             )
@@ -547,7 +547,8 @@ def _get_movie(movie_id: int):
             cursor = conn.cursor()
             cursor.execute(
                 """
-                SELECT Id, Title, Genre, DurationMinutes, Rating, Description
+                SELECT Id, Title, Genre, DurationMinutes, Rating, Description,
+                       Director, MainActors, ReleaseDate
                 FROM Movies
                 WHERE Id = ?
                 """,
@@ -920,7 +921,47 @@ def _build_seat_status_reply(message: str, now: datetime) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Movie reply
+#  Specific movie info reply — trả lời câu hỏi về thông tin 1 phim cụ thể
+# ─────────────────────────────────────────────────────────────────────────────
+def _build_specific_movie_info_reply(movie, now: datetime) -> dict:
+    """Trả thông tin chi tiết (thể loại, đạo diễn, diễn viên…) cho 1 phim cụ thể."""
+    lines = [f"**{movie.Title}**"]
+    if movie.Genre:
+        lines.append(f"- Thể loại: {movie.Genre}")
+    if movie.DurationMinutes:
+        lines.append(f"- Thời lượng: {movie.DurationMinutes} phút")
+    if movie.Rating:
+        lines.append(f"- Phân loại: {movie.Rating}")
+    director = getattr(movie, "Director", None)
+    if director:
+        lines.append(f"- Đạo diễn: {director}")
+    main_actors = getattr(movie, "MainActors", None)
+    if main_actors:
+        lines.append(f"- Diễn viên chính: {main_actors}")
+
+    next_showtimes = _next_showtimes_for_movie(movie.Id, now)
+    if next_showtimes:
+        lines.append("- Suất gần nhất: " + "; ".join(
+            f"{s.StartTime.strftime('%d/%m %H:%M')} ({_format_room(s.RoomName)})"
+            for s in next_showtimes
+        ))
+
+    actions = [{
+        "type": "view_movie",
+        "label": f"Xem chi tiết {movie.Title[:20]}",
+        "url": f"/Movies/Details/{movie.Id}",
+        "movieId": movie.Id,
+    }]
+    actions.extend(_build_showtime_actions(next_showtimes))
+    return {
+        "reply": "\n".join(lines),
+        "actions": actions,
+        "session_update": {"last_movie_id": movie.Id, "last_movie_title": movie.Title},
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Movie reply — danh sách phim đang chiếu (câu hỏi chung)
 # ─────────────────────────────────────────────────────────────────────────────
 def _build_movie_reply(now: datetime) -> dict:
     sql = """
@@ -1250,7 +1291,16 @@ def try_build_routed_reply(message: str, page_context: dict, user_id: Optional[i
 
     # Movie info / list
     if is_movie_question(nm):
-        logger.info("intent=movie_info user=%s", user_id)
+        # Nếu câu hỏi không phải dạng "liệt kê toàn bộ" thì thử resolve phim cụ thể trước
+        if not asks_global_movie_list(nm):
+            page_movie_id = page_context.get("movieId") if page_context else None
+            specific = (
+                _get_movie(int(page_movie_id)) if page_movie_id else None
+            ) or _resolve_requested_movie(nm)
+            if specific:
+                logger.info("intent=movie_info_specific user=%s movie=%s", user_id, specific.Title)
+                return _build_specific_movie_info_reply(specific, now)
+        logger.info("intent=movie_info_list user=%s", user_id)
         return _build_movie_reply(now)
 
     # Food / menu
