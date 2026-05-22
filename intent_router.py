@@ -50,7 +50,10 @@ _SYNONYM_GROUPS: list[tuple[list[str], str]] = [
     # ── Nội dung / thông tin phim ─────────────────────────────────────────
     (["cot truyen", "tom tat phim", "tom tat noi dung",
       "noi dung chinh", "kich ban", "nhan vat chinh",
-      "ke ve cai gi", "phim ke ve"], "noi dung phim"),
+      "ke ve cai gi", "phim ke ve",
+      # Câu hỏi tra phim theo nhân vật / diễn viên
+      "nhan vat trong", "trong phim nao", "phim nao co nhan vat",
+      "la nhan vat", "xuat hien trong phim", "dong vai"], "noi dung phim"),
     (["co hay khong", "hay khong", "nen xem khong",
       "dang xem khong", "co dang xem khong", "tot khong",
       "nhu the nao", "the nao", "cam nhan", "danh gia",
@@ -177,6 +180,12 @@ _AGE_QUESTION_WORDS = [
 #  Intent detectors — port of Is*Question() methods
 # ─────────────────────────────────────────────────────────────────────────────
 def asks_global_movie_list(nm: str) -> bool:
+    # Loại trừ câu hỏi dạng "X trong phim nào" / "nhân vật X phim nào"
+    # — đây là tra cứu phim theo nhân vật/diễn viên, KHÔNG phải "list suất chiếu"
+    if "trong phim nao" in nm:
+        return False
+    if any(kw in nm for kw in ["nhan vat", "dien vien nao", "ai dong vai", "vai chinh la"]):
+        return False
     return any(kw in nm for kw in ["phim gi", "phim nao", "dang chieu", "hom nay co phim", "toi nay co phim"])
 
 
