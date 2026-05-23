@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 from db import get_movie_context, get_food_context, get_knowledge_context
 from gemini import call_gemini, build_system_prompt
-from intent_router import try_build_routed_reply
+from intent_router import try_build_routed_reply, append_related_movies_to_gemini_reply
 from admin_router import try_build_admin_reply
 from staff_router import try_build_staff_reply
 import session_store
@@ -143,5 +143,10 @@ def chat(req: ChatRequest, request: Request):
     system_prompt = build_system_prompt(movie_context, food_context, knowledge_context, page_note)
 
     reply = call_gemini(api_key, system_prompt, req.history[-_MAX_HISTORY:], message)
+
+    # Nếu câu hỏi về nhân vật → rà soát DB đề xuất phim liên quan
+    augmented = append_related_movies_to_gemini_reply(message, reply, now_vn)
+    if augmented is not None:
+        return ChatResponse(reply=augmented["reply"], actions=augmented.get("actions", []))
 
     return ChatResponse(reply=reply)

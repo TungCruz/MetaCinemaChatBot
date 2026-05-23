@@ -395,6 +395,197 @@ def _build_character_search_reply(message: str, now: datetime) -> Optional[dict]
     }
 
 
+# Các từ thông thường trong tên phim, không dùng để khớp
+_TITLE_STOPWORDS = {
+    "cua", "va", "la", "mot", "trong", "nao", "co", "hay", "bat",
+    "cung", "de", "du", "thi", "voi", "cho", "ma", "khi", "theo",
+    "len", "xuong", "ra", "vao", "anh", "phim", "the", "and", "of",
+}
+
+
+def append_related_movies_to_gemini_reply(
+    message: str, gemini_reply: str, now: datetime
+) -> Optional[dict]:
+    """Sau khi Gemini trả lời câu hỏi nhân vật, rà soát DB tìm phim liên quan.
+    Nếu tìm thấy, gắn thêm phần đề xuất vào cuối reply Gemini và trả về dict mới.
+    Trả về None nếu không phải câu hỏi nhân vật hoặc không tìm thấy phim phù hợp."""
+    nm = expand_synonyms(normalize(message))
+    if not is_character_search_question(nm):
+        return None
+
+    reply_norm = normalize(gemini_reply)
+
+    try:
+        with get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT m.Id, m.Title, m.ReleaseDate, m.MainActors,
+                       (SELECT MIN(s.StartTime) FROM Showtimes s
+                        WHERE s.MovieId = m.Id AND s.StartTime >= ?) AS FirstShowtime
+                FROM Movies m
+                """,
+                now,
+            )
+            movies = cursor.fetchall()
+    except Exception:
+        return None
+
+    def _word_in_reply(token: str) -> bool:
+        return bool(re.search(r'\b' + re.escape(token) + r'\b', reply_norm))
+
+    matched = []
+    for movie in movies:
+        title_norm = normalize(movie.Title)
+        tokens = [t for t in title_norm.split()
+                  if len(t) >= 3 and t not in _TITLE_STOPWORDS]
+        sig   = [t for t in tokens if len(t) >= 5]
+        short = [t for t in tokens if 3 <= len(t) < 5]
+
+        sig_hits   = sum(1 for t in sig   if _word_in_reply(t))
+        short_hits = sum(1 for t in short if _word_in_reply(t))
+
+        # Khớp nếu ≥1 từ dài (≥5 ký tự) hoặc ≥2 từ ngắn (3–4 ký tự) xuất hiện trong reply
+        if sig_hits >= 1 or short_hits >= 2:
+            matched.append(movie)
+
+    if not matched:
+        return None
+
+    lines = [gemini_reply, "", "---", "Tại **MetaCinema** hiện có phim liên quan:"]
+    actions = []
+    for m in matched[:3]:
+        showtime_part = ""
+        if m.FirstShowtime:
+            showtime_part = f" | Suất gần nhất: {m.FirstShowtime.strftime('%d/%m %H:%M')}"
+        elif m.ReleaseDate:
+            rd = m.ReleaseDate.date() if isinstance(m.ReleaseDate, datetime) else m.ReleaseDate
+            showtime_part = f" | Dự kiến chiếu: {rd.strftime('%d/%m/%Y')}"
+        lines.append(f"- **{m.Title}**{showtime_part}")
+        actions.append({
+            "type": "view_movie",
+            "label": f"Xem {m.Title[:22]}",
+            "url": f"/Movies/Details/{m.Id}",
+            "movieId": m.Id,
+        })
+
+    for m in [mv for mv in matched if mv.FirstShowtime][:2]:
+        next_sts = _next_showtimes_for_movie(m.Id, now, limit=2)
+        actions.extend(_build_showtime_actions(next_sts))
+
+    return {
+        "reply": "\n".join(lines),
+        "actions": actions[:6],
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Genre filter — "đề xuất phim Hoạt Hình", "phim Action", …
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Normalized keyword → Vietnamese genre name (dùng cho DB LIKE query)
+_GENRE_MAP: dict[str, str] = {
+    "hoat hinh":        "Hoạt Hình",
+    "anime":            "Hoạt Hình",
+    "hanh dong":        "Hành Động",
+    "action":           "Hành Động",
+    "kinh di":          "Kinh Dị",
+    "horror":           "Kinh Dị",
+    "tinh cam":         "Tình Cảm",
+    "romance":          "Tình Cảm",
+    "lang man":         "Tình Cảm",
+    "hai huoc":         "Hài Hước",
+    "comedy":           "Hài Hước",
+    "vien tuong":       "Viễn Tưởng",
+    "sci fi":           "Viễn Tưởng",
+    "khoa hoc":         "Viễn Tưởng",
+    "phieu luu":        "Phiêu Lưu",
+    "adventure":        "Phiêu Lưu",
+    "gia dinh":         "Gia Đình",
+    "family":           "Gia Đình",
+    "tam ly":           "Tâm Lý",
+    "thriller":         "Hồi Hộp",
+    "hoi hop":          "Hồi Hộp",
+    "bi an":            "Bí Ẩn",
+    "mystery":          "Bí Ẩn",
+    "lich su":          "Lịch Sử",
+    "chien tranh":      "Chiến Tranh",
+    "sieu anh hung":    "Siêu Anh Hùng",
+    "superhero":        "Siêu Anh Hùng",
+}
+
+# Trigger words yêu cầu ngữ cảnh "phim/đề xuất/…" để tránh false positive
+_GENRE_TRIGGERS: list[str] = [
+    "phim", "de xuat", "goi y", "co phim", "xem gi", "muon xem",
+    "tim phim", "the loai", "xem phim", "chieu phim",
+]
+
+
+def is_genre_question(nm: str) -> Optional[str]:
+    """Phát hiện câu hỏi đề xuất theo thể loại.
+    Trả về tên thể loại (Vietnamese) nếu khớp, None nếu không."""
+    if not any(kw in nm for kw in _GENRE_TRIGGERS):
+        return None
+    for key, genre in _GENRE_MAP.items():
+        if key in nm:
+            return genre
+    return None
+
+
+def _build_genre_reply(genre: str, now: datetime) -> dict:
+    """Trả danh sách TẤT CẢ phim thuộc thể loại, bao gồm cả phim chưa có lịch."""
+    sql = """
+        SELECT m.Id, m.Title, m.Genre, m.DurationMinutes, m.Rating,
+               m.ReleaseDate, m.Description, m.MainActors,
+               (SELECT MIN(s.StartTime) FROM Showtimes s
+                WHERE s.MovieId = m.Id AND s.StartTime >= ?) AS FirstShowtime
+        FROM Movies m
+        WHERE m.Genre LIKE ?
+        ORDER BY FirstShowtime, m.ReleaseDate, m.Title
+    """
+    try:
+        with get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(sql, now, f"%{genre}%")
+            movies = cursor.fetchall()
+    except Exception as e:
+        return {"reply": f"Không thể tải danh sách phim: {e}", "actions": []}
+
+    if not movies:
+        return {
+            "reply": f"Hiện MetaCinema chưa có phim thể loại **{genre}** nào trong hệ thống.",
+            "actions": [],
+        }
+
+    lines = [f"MetaCinema có {len(movies)} phim thể loại **{genre}**:"]
+    actions = []
+    for m in movies:
+        if m.FirstShowtime:
+            time_part = f" | Suất gần nhất: {m.FirstShowtime.strftime('%d/%m %H:%M')}"
+        elif m.ReleaseDate:
+            rd = m.ReleaseDate.date() if isinstance(m.ReleaseDate, datetime) else m.ReleaseDate
+            time_part = f" | Dự kiến chiếu: {rd.strftime('%d/%m/%Y')}"
+        else:
+            time_part = ""
+        lines.append(f"- **{m.Title}**{time_part}")
+        actions.append({
+            "type": "view_movie",
+            "label": f"Xem {m.Title[:22]}",
+            "url": f"/Movies/Details/{m.Id}",
+            "movieId": m.Id,
+        })
+
+    # Nút đặt vé cho tối đa 2 phim đang có suất
+    for m in [mv for mv in movies if mv.FirstShowtime][:2]:
+        next_sts = _next_showtimes_for_movie(m.Id, now, limit=2)
+        actions.extend(_build_showtime_actions(next_sts))
+
+    return {
+        "reply": "\n".join(lines),
+        "actions": actions[:8],
+    }
+
+
 def is_my_tickets_question(nm: str) -> bool:
     return any(kw in nm for kw in [
         "ve cua toi", "ve toi", "ve da dat", "lich su ve",
@@ -1295,6 +1486,13 @@ def try_build_routed_reply(message: str, page_context: dict, user_id: Optional[i
         # Không có trong DB (ví dụ: nhân vật anime) → để Gemini trả lời
         logger.info("intent=gemini_fallback(character) user=%s msg=%.60r", user_id, message)
         return None
+
+    # Genre filter — "đề xuất phim Hoạt Hình", "phim Action", …
+    # Chạy TRƯỚC is_movie_question để câu hỏi thể loại không rơi vào danh sách chung
+    genre = is_genre_question(nm)
+    if genre is not None:
+        logger.info("intent=genre_filter genre=%s user=%s", genre, user_id)
+        return _build_genre_reply(genre, now)
 
     # Movie info / list
     if is_movie_question(nm):
