@@ -4,8 +4,12 @@ Auth: C# passes role from Session["StaffRole"] → Python trusts it (C# is auth 
 """
 import re
 import json
+import os
 import session_store
+import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta, date as date_type, time as dt_time
+from pathlib import Path
 from typing import Optional
 from db import get_conn
 from intent_router import normalize, expand_synonyms, _apply_synonyms, extract_requested_date, _format_room
@@ -253,7 +257,16 @@ def _is_admin_chatbot_training_q(nm: str) -> bool:
     return any(kw in nm for kw in ["chatbot", "huan luyen", "knowledge", "kien thuc", "train"])
 
 def _is_admin_attendance_q(nm: str) -> bool:
-    return any(kw in nm for kw in ["cham cong", "check in", "check out", "ca lam", "gio lam", "tien cong"])
+    return any(kw in nm for kw in [
+        "cham cong", "check in", "check out", "ca lam", "gio lam",
+        "tien cong", "bang cong", "luong", "tien luong", "payroll",
+    ])
+
+def _is_admin_payroll_q(nm: str) -> bool:
+    return any(kw in nm for kw in [
+        "luong", "tien luong", "tinh luong", "bang luong", "payroll",
+        "can tra", "phai tra", "tra cho nhan vien",
+    ])
 
 def _is_admin_counter_sale_q(nm: str) -> bool:
     return any(kw in nm for kw in ["ban tai quay", "quay ban", "ban truc tiep", "thu ngan", "counter"])
@@ -640,6 +653,164 @@ def _staff(message: str, nm: str) -> dict:
         }
     except Exception as e:
         return {"reply": f"Lỗi tải nhân viên: {e}", "actions": []}
+
+
+def _parse_attendance_datetime(value) -> Optional[datetime]:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        ms = re.search(r"/Date\((-?\d+)", value)
+        if ms:
+            try:
+                return datetime.utcfromtimestamp(int(ms.group(1)) / 1000)
+            except Exception:
+                return None
+        text = value.strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone().replace(tzinfo=None)
+            return parsed
+        except Exception:
+            return None
+    return None
+
+
+def _attendance_file_candidates() -> list[Path]:
+    here = Path(__file__).resolve()
+    candidates = []
+    env_path = os.getenv("ATTENDANCE_JSON_PATH", "").strip()
+    if env_path:
+        candidates.append(Path(env_path))
+    candidates.extend([
+        here.parents[1] / "MetaCinemaWeb" / "RapChieuPhim" / "App_Data" / "attendance.json",
+        here.parents[1] / "MetaCinemaWeb" / "RapChieuPhim" / "bin" / "App_Data" / "attendance.json",
+    ])
+    return candidates
+
+
+def _load_attendance_json_records() -> Optional[list[dict]]:
+    for path in _attendance_file_candidates():
+        try:
+            if not path.exists():
+                continue
+            raw = path.read_text(encoding="utf-8-sig")
+            data = json.loads(raw or "[]")
+            return data if isinstance(data, list) else []
+        except Exception:
+            continue
+    return None
+
+
+def _fetch_attendance_via_api(rng: dict) -> Optional[list[dict]]:
+    web_base_url = os.getenv("WEB_BASE_URL", "").rstrip("/")
+    if not web_base_url:
+        return None
+
+    end_inclusive = rng["end_vn"].date() - timedelta(days=1)
+    params = {
+        "from": rng["start_vn"].date().strftime("%Y-%m-%d"),
+        "to": end_inclusive.strftime("%Y-%m-%d"),
+    }
+    url = f"{web_base_url}/Api/ChatbotAttendanceData?{urllib.parse.urlencode(params)}"
+    secret = os.getenv("INTERNAL_SECRET") or os.getenv("CHATBOT_INTERNAL_SECRET", "")
+    headers = {"X-Internal-Secret": secret} if secret else {}
+
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if data.get("success") and isinstance(data.get("items"), list):
+                return data["items"]
+    except Exception:
+        return None
+    return None
+
+
+def _load_admin_attendance_records(message: str, nm: str, now: datetime, default: str) -> tuple[list[dict], dict, bool]:
+    rng = _build_report_range(message, nm, now, default)
+
+    api_records = _fetch_attendance_via_api(rng)
+    if api_records is not None:
+        records = api_records
+        source_available = True
+    else:
+        local_records = _load_attendance_json_records()
+        source_available = local_records is not None
+        records = []
+        if local_records is not None:
+            for item in local_records:
+                check_in = _parse_attendance_datetime(item.get("CheckIn") or item.get("checkIn"))
+                if check_in and rng["start_utc"] <= check_in < rng["end_utc"]:
+                    records.append(item)
+
+    filtered = []
+    for item in records:
+        role = item.get("Role") or item.get("role") or ""
+        if normalize(role) == "admin":
+            continue
+        filtered.append(item)
+    return filtered, rng, source_available
+
+
+def _admin_attendance_summary(message: str, nm: str, now: datetime, *, payroll: bool) -> dict:
+    records, rng, source_available = _load_admin_attendance_records(
+        message, nm, now, "month" if payroll else "week")
+
+    action = _admin_action("Chấm công", "Attendance")
+    if not source_available:
+        return {
+            "reply": (
+                "Mình chưa đọc được dữ liệu chấm công để tổng hợp lương. "
+                "Bạn có thể mở trang Chấm công để xem trực tiếp."
+            ),
+            "actions": [action],
+        }
+
+    title = "Tổng hợp tiền lương" if payroll else "Tổng hợp chấm công"
+    lines = [f"{title} {rng['label'].lower()}:"]
+
+    if not records:
+        lines.append("- Chưa có lượt chấm công nào trong khoảng này.")
+        lines.append("- Tổng giờ: 0.00h; tổng lương tạm tính: 0đ.")
+        return {"reply": "\n".join(lines), "actions": [action]}
+
+    total_hours = sum(float(r.get("Hours") or r.get("hours") or 0) for r in records)
+    total_amount = sum(float(r.get("Amount") or r.get("amount") or 0) for r in records)
+    staff_ids = {r.get("StaffId") or r.get("staffId") for r in records}
+    open_shifts = sum(1 for r in records if not (r.get("CheckOut") or r.get("checkOut")))
+
+    lines.append(f"- {len(records)} lượt chấm công, {len([x for x in staff_ids if x])} nhân viên.")
+    lines.append(f"- Tổng giờ: {total_hours:.2f}h; tổng lương tạm tính: {_fmt_money(total_amount)}.")
+    if open_shifts:
+        lines.append(f"- Có {open_shifts} ca đang mở, các ca này chưa được tính đủ tiền cho đến khi check-out.")
+
+    from collections import defaultdict
+    by_staff = defaultdict(lambda: {"name": "Nhân viên", "role": "", "hours": 0.0, "amount": 0.0, "open": 0})
+    for item in records:
+        key = item.get("StaffId") or item.get("staffId") or item.get("StaffName") or item.get("staffName") or "unknown"
+        bucket = by_staff[key]
+        bucket["name"] = item.get("StaffName") or item.get("staffName") or bucket["name"]
+        bucket["role"] = item.get("Role") or item.get("role") or bucket["role"]
+        bucket["hours"] += float(item.get("Hours") or item.get("hours") or 0)
+        bucket["amount"] += float(item.get("Amount") or item.get("amount") or 0)
+        if not (item.get("CheckOut") or item.get("checkOut")):
+            bucket["open"] += 1
+
+    staff_lines = sorted(by_staff.values(), key=lambda x: (x["amount"], x["hours"]), reverse=True)
+    lines.append("Theo nhân viên:")
+    for item in staff_lines[:8]:
+        role = f" ({item['role']})" if item["role"] else ""
+        open_note = f", {item['open']} ca đang mở" if item["open"] else ""
+        lines.append(f"- {item['name']}{role}: {item['hours']:.2f}h, {_fmt_money(item['amount'])}{open_note}.")
+    if len(staff_lines) > 8:
+        lines.append(f"- ... còn {len(staff_lines) - 8} nhân viên khác.")
+
+    return {"reply": "\n".join(lines), "actions": [action]}
 
 
 def _staff_set_role(message: str, nm: str) -> dict:
@@ -1723,11 +1894,10 @@ def try_build_admin_reply(message: str, role: Optional[str], now: datetime, user
         return _chatbot_training()
     if _is_admin_counter_sale_q(nm):
         return _counter_sales(message, nm, now)
+    if _is_admin_payroll_q(nm):
+        return _admin_attendance_summary(message, nm, now, payroll=True)
     if _is_admin_attendance_q(nm):
-        return {
-            "reply": "Mình chưa hỗ trợ xem chấm công qua chatbot Python. Bạn vào trang Chấm công để xem chi tiết.",
-            "actions": [_admin_action("Chấm công", "Attendance")]
-        }
+        return _admin_attendance_summary(message, nm, now, payroll=False)
     if _is_admin_payment_q(nm):
         return _payment(message, nm, now)
     if _is_admin_showtime_q(nm):

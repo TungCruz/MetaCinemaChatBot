@@ -306,33 +306,40 @@ def _search_movies_by_actor(actor_name: str, now: datetime) -> list:
     if not name_tokens:
         return []
 
+    def _word_in(token: str, text: str) -> bool:
+        """Kiểm tra token xuất hiện như một từ riêng (word boundary) trong text."""
+        return bool(re.search(r'\b' + re.escape(token) + r'\b', text))
+
+    qualifying = [t for t in name_tokens if len(t) >= 3]
+
     matched = []
     for movie in movies:
         actors_norm = normalize(movie.MainActors or "")
         desc_norm   = normalize(movie.Description or "")
 
-        # Ưu tiên tìm trong MainActors — đây là nguồn chính
-        actor_score = 0
+        # Khớp cụm đầy đủ → ưu tiên cao nhất
         if name_norm in actors_norm:
-            actor_score += len(name_tokens) * 10   # khớp đầy đủ → điểm cao nhất
-        else:
-            actor_score += sum(5 if len(t) >= 5 else 2
-                               for t in name_tokens if t in actors_norm)
+            matched.append((len(name_tokens) * 10, len(name_tokens) * 10, movie))
+            continue
+        if name_norm in desc_norm:
+            matched.append((len(name_tokens) * 4, 0, movie))
+            continue
 
-        # Fallback: tìm trong Description nếu MainActors không có
+        # Khớp từng token — YÊU CẦU tất cả qualifying tokens đều phải xuất hiện
+        actor_score = 0
         desc_score = 0
-        if actor_score == 0:
-            if name_norm in desc_norm:
-                desc_score += len(name_tokens) * 4
+        all_found = True
+        for t in qualifying:
+            if _word_in(t, actors_norm):
+                actor_score += 5 if len(t) >= 5 else 2
+            elif _word_in(t, desc_norm):
+                desc_score += 2 if len(t) >= 5 else 1
             else:
-                desc_score += sum(2 if len(t) >= 5 else 1
-                                  for t in name_tokens if t in desc_norm)
+                all_found = False
+                break
 
-        total = actor_score + desc_score
-        # Ngưỡng: phải khớp ít nhất 1 token có nghĩa (≥ 3 ký tự)
-        threshold = max(1, len([t for t in name_tokens if len(t) >= 3]) - 1)
-        if total >= threshold:
-            matched.append((total, actor_score, movie))
+        if all_found and (actor_score + desc_score) > 0:
+            matched.append((actor_score + desc_score, actor_score, movie))
 
     # Sắp xếp: MainActors match trước, sau đó theo total score
     matched.sort(key=lambda x: (-x[1], -x[0]))
